@@ -133,6 +133,7 @@ temp/
 
 # ML caches
 .cache/
+cache/
 huggingface/
 transformers_cache/
 torch_cache/
@@ -147,6 +148,7 @@ mlruns/
 # Jupyter Notebook
 .ipynb_checkpoints/
 *.ipynb
+!notebooks/*.ipynb
 
 # Testing
 .pytest_cache/

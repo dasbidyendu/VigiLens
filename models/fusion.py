@@ -2,15 +2,38 @@
 Modality-aware fusion module for RGB and IR features.
 
 Supports RGB+IR, RGB-only, and IR-only modes with learnable fusion.
+Availability can be a single boolean or a per-sample boolean tensor, which
+makes modality dropout correct when a batch mixes available and missing
+modalities.
 """
+
+from typing import Optional, Union
+import logging
 
 import torch
 import torch.nn as nn
-import numpy as np
-from typing import Optional, Tuple
-import logging
 
 logger = logging.getLogger(__name__)
+
+Availability = Union[bool, torch.Tensor, None]
+
+
+def _availability_mask(value: Availability,
+                       batch_size: int,
+                       device: torch.device) -> torch.Tensor:
+    """Normalize a boolean/tensor availability flag to shape (B,)."""
+    if value is None:
+        return torch.zeros(batch_size, dtype=torch.bool, device=device)
+    if isinstance(value, bool):
+        return torch.full((batch_size,), value, dtype=torch.bool, device=device)
+    mask = torch.as_tensor(value, device=device).bool().reshape(-1)
+    if mask.numel() == 1:
+        mask = mask.expand(batch_size)
+    if mask.numel() != batch_size:
+        raise ValueError(
+            f"Availability mask has {mask.numel()} elements, expected {batch_size}"
+        )
+    return mask
 
 
 class ModalityAwareFusion(nn.Module):
@@ -18,12 +41,13 @@ class ModalityAwareFusion(nn.Module):
     Modality-aware fusion for RGB and IR features.
 
     Supports:
-    - RGB + IR: Both modalities contribute
-    - RGB only: RGB embedding dominates
-    - IR only: IR embedding dominates
+    - RGB + IR: both modalities contribute
+    - RGB only: RGB embedding is adapted
+    - IR only: IR embedding is adapted
+    - Neither: zero embedding
 
-    Uses learnable projections and gated fusion.
-    Output dimension is fixed (512-D) regardless of missing modalities.
+    Uses learnable projections and gated fusion. Output dimension is fixed
+    (512-D) regardless of missing modalities.
     """
 
     def __init__(self,
@@ -77,53 +101,81 @@ class ModalityAwareFusion(nn.Module):
             nn.LayerNorm(output_dim)
         )
 
-        logger.info(f"Modality-aware fusion: input={input_dim}, hidden={hidden_dim}, output={output_dim}")
+        logger.info(
+            f"Modality-aware fusion: input={input_dim}, hidden={hidden_dim}, "
+            f"output={output_dim}"
+        )
 
     def forward(self,
-                rgb_features: torch.Tensor,
+                rgb_features: Optional[torch.Tensor],
                 ir_features: Optional[torch.Tensor] = None,
-                rgb_available: bool = True,
-                ir_available: bool = True) -> torch.Tensor:
+                rgb_available: Availability = True,
+                ir_available: Availability = True) -> torch.Tensor:
         """
-        Fuse RGB and IR features with modality awareness.
+        Fuse RGB and IR features with per-sample modality awareness.
 
         Args:
-            rgb_features: RGB features (B, 2048)
-            ir_features: IR features (B, 2048) or None
-            rgb_available: Whether RGB modality is available
-            ir_available: Whether IR modality is available
+            rgb_features: RGB features (B, input_dim) or None
+            ir_features: IR features (B, input_dim) or None
+            rgb_available: bool or (B,) tensor
+            ir_available: bool or (B,) tensor
 
         Returns:
-            Fused features (B, 512)
+            Fused features (B, output_dim)
         """
-        # Project RGB features
-        if rgb_available:
+        if rgb_features is not None:
+            batch_size = rgb_features.shape[0]
+            device = rgb_features.device
+            dtype = rgb_features.dtype
+        elif ir_features is not None:
+            batch_size = ir_features.shape[0]
+            device = ir_features.device
+            dtype = ir_features.dtype
+        else:
+            raise ValueError("At least one of rgb_features or ir_features is required")
+
+        rgb_mask = _availability_mask(rgb_available, batch_size, device)
+        ir_mask = _availability_mask(ir_available, batch_size, device)
+
+        # A modality cannot be used if its features were not supplied.
+        if rgb_features is None:
+            rgb_mask = torch.zeros_like(rgb_mask)
+        if ir_features is None:
+            ir_mask = torch.zeros_like(ir_mask)
+
+        zero_hidden = torch.zeros(batch_size, self.hidden_dim, device=device, dtype=dtype)
+        zero_out = torch.zeros(batch_size, self.output_dim, device=device, dtype=dtype)
+
+        if rgb_features is not None:
             rgb_embed = self.rgb_projection(rgb_features)
         else:
-            # Zero embedding if unavailable
-            rgb_embed = torch.zeros(rgb_features.shape[0], self.hidden_dim, device=rgb_features.device)
+            rgb_embed = zero_hidden
+        rgb_embed = rgb_embed * rgb_mask.unsqueeze(1).to(dtype)
 
-        # Project IR features
-        if ir_available and ir_features is not None:
+        if ir_features is not None:
             ir_embed = self.ir_projection(ir_features)
         else:
-            # Zero embedding if unavailable
-            ir_embed = torch.zeros(rgb_features.shape[0], self.hidden_dim, device=rgb_features.device)
+            ir_embed = zero_hidden
+        ir_embed = ir_embed * ir_mask.unsqueeze(1).to(dtype)
 
-        # Fusion based on availability
-        if rgb_available and ir_available:
-            # Both modalities: concatenate and fuse
-            combined = torch.cat([rgb_embed, ir_embed], dim=1)
-            fused = self.fusion_layer(combined)
-        elif rgb_available:
-            # RGB only: adapt RGB embedding
-            fused = self.rgb_adapt(rgb_embed)
-        elif ir_available:
-            # IR only: adapt IR embedding
-            fused = self.ir_adapt(ir_embed)
+        # Both modalities
+        both_mask = rgb_mask & ir_mask
+        if both_mask.any():
+            fused_both = self.fusion_layer(torch.cat([rgb_embed, ir_embed], dim=1))
         else:
-            # Neither available: return zeros
-            fused = torch.zeros(rgb_features.shape[0], self.output_dim, device=rgb_features.device)
+            fused_both = zero_out
+
+        # RGB only
+        rgb_only_mask = rgb_mask & ~ir_mask
+        fused_rgb = self.rgb_adapt(rgb_embed) if rgb_only_mask.any() else zero_out
+
+        # IR only
+        ir_only_mask = ir_mask & ~rgb_mask
+        fused_ir = self.ir_adapt(ir_embed) if ir_only_mask.any() else zero_out
+
+        fused = torch.where(both_mask.unsqueeze(1), fused_both, zero_out)
+        fused = torch.where(rgb_only_mask.unsqueeze(1), fused_rgb, fused)
+        fused = torch.where(ir_only_mask.unsqueeze(1), fused_ir, fused)
 
         return fused
 

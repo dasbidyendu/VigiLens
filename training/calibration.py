@@ -1,239 +1,187 @@
 """
-Anomaly calibration module.
+Anomaly calibration.
 
-Calculates normal prediction-error statistics and sets anomaly threshold.
-Saves calibration information with the model checkpoint.
+Calibration collects prediction errors on held-out **normal** videos and sets
+the anomaly threshold to ``mean + k * std`` (with a percentile alternative).
+The threshold is saved as JSON next to the model checkpoint and is loaded by
+the Streamlit app and by offline evaluation.
 """
 
-import torch
-import numpy as np
-from pathlib import Path
-from typing import Dict, List
+from __future__ import annotations
+
+import argparse
 import json
 import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Union
+
+import numpy as np
+import torch
 from tqdm import tqdm
 
-from models.anomaly_model import VigiLensModel
-from training.dataset import NormalVideoDataset
-from torch.utils.data import DataLoader
+from training.scoring import prediction_errors
 
 logger = logging.getLogger(__name__)
 
 
 class AnomalyCalibrator:
-    """
-    Calibrates anomaly detection threshold using normal validation data.
-
-    Collects prediction errors from normal videos and computes statistics.
-    """
+    """Calibrate an anomaly threshold from normal prediction errors."""
 
     def __init__(self,
-                 model: VigiLensModel,
+                 model,
                  k_std: float = 3.0,
                  percentile: float = 95.0):
-        """
-        Initialize calibrator.
-
-        Args:
-            model: Trained VigiLens model
-            k_std: Number of standard deviations for threshold (mean + k * std)
-            percentile: Percentile for threshold (alternative method)
-        """
         self.model = model
-        self.k_std = k_std
-        self.percentile = percentile
+        self.k_std = float(k_std)
+        self.percentile = float(percentile)
+
+    def collect_errors_from_caches(self,
+                                   cache_paths: Sequence[Union[str, Path]],
+                                   device: Optional[str] = None,
+                                   batch_size: int = 8,
+                                   sequence_length: int = 16,
+                                   limit: Optional[int] = None) -> List[float]:
+        """Collect per-frame prediction errors from cached feature files."""
+        cache_paths = [Path(path) for path in cache_paths]
+        if limit is not None:
+            cache_paths = cache_paths[:limit]
+        if not cache_paths:
+            raise ValueError("No cache files were provided for calibration")
+
+        self.model.eval()
+        errors = prediction_errors(
+            self.model,
+            tqdm(cache_paths, desc="Calibrating"),
+            smoothing_window=1,
+            device=device,
+        )
+        return errors.tolist()
 
     def collect_errors(self,
-                      val_videos: List[Path],
-                      val_ir_videos: List[Path],
-                      device: str,
-                      batch_size: int = 4) -> List[float]:
+                       val_videos: Sequence[Union[str, Path]],
+                       val_ir_videos: Optional[Sequence[Union[str, Path]]] = None,
+                       device: Optional[str] = None,
+                       batch_size: int = 8) -> List[float]:
         """
-        Collect prediction errors from normal validation videos.
+        Backward-compatible entry point.
 
-        Args:
-            val_videos: List of validation RGB video paths
-            val_ir_videos: List of validation IR video paths
-            device: Device
-            batch_size: Batch size
-
-        Returns:
-            List of prediction errors
+        Calibration must use the same features as training.  Pass the ``.pt``
+        files produced by ``python -m training.precompute``; passing raw video
+        files raises an informative error instead of silently using a
+        different feature path.
         """
-        self.model.eval()
-        self.model.reset_stream()
-
-        errors = []
-
-        # Create validation dataset
-        val_dataset = NormalVideoDataset(
-            val_videos,
-            val_ir_videos,
-            sequence_length=16,
-            rgb_dropout_prob=0.0,
-            ir_dropout_prob=0.0
+        paths = [Path(path) for path in val_videos]
+        if paths and all(path.suffix.lower() == ".pt" for path in paths):
+            return self.collect_errors_from_caches(paths, device=device, batch_size=batch_size)
+        raise ValueError(
+            "Calibration expects precomputed .pt feature caches. Run "
+            "`python -m training.precompute` first, then pass the cache files "
+            "or use `--cache-dir`."
         )
 
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    def compute_threshold(self, errors: Sequence[float]) -> Dict:
+        """Compute calibration statistics from normal prediction errors."""
+        values = np.asarray(errors, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError("Cannot calibrate: no finite prediction errors were collected")
 
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Collecting errors"):
-                rgb_sequence = batch['rgb_sequence']
-                batch_size = rgb_sequence.shape[0]
-                sequence_length = rgb_sequence.shape[1]
-
-                # Reset stream for each video
-                self.model.reset_stream()
-
-                for t in range(sequence_length):
-                    rgb_frame = rgb_sequence[:, t]
-                    ir_frame = batch['ir_sequence'][:, t] if batch['ir_sequence'] is not None else None
-
-                    # Placeholder features (real implementation uses actual extractors)
-                    fused = torch.randn(batch_size, 512).to(device)
-
-                    # Process frame
-                    result = self.model.process_frame(
-                        rgb_frame.cpu().numpy(),
-                        ir_frame.cpu().numpy() if ir_frame is not None else None,
-                        rgb_available=True,
-                        ir_available=ir_frame is not None
-                    )
-
-                    if result['anomaly_score'] is not None:
-                        errors.append(result['anomaly_score'])
-
-        return errors
-
-    def compute_threshold(self, errors: List[float]) -> Dict:
-        """
-        Compute anomaly threshold from error statistics.
-
-        Args:
-            errors: List of prediction errors from normal data
-
-        Returns:
-            Dictionary containing calibration statistics
-        """
-        errors = np.array(errors)
-
-        mean_error = np.mean(errors)
-        std_error = np.std(errors)
-        median_error = np.median(errors)
-
-        # Threshold methods
+        mean_error = float(np.mean(values))
+        std_error = float(np.std(values))
+        median_error = float(np.median(values))
+        p95 = float(np.percentile(values, self.percentile))
         threshold_std = mean_error + self.k_std * std_error
-        threshold_percentile = np.percentile(errors, self.percentile)
+        threshold_percentile = float(np.percentile(values, self.percentile))
 
         calibration_info = {
-            'mean_error': float(mean_error),
-            'std_error': float(std_error),
-            'median_error': float(median_error),
-            'threshold_std': float(threshold_std),
-            'threshold_percentile': float(threshold_percentile),
-            'k_std': self.k_std,
-            'percentile': self.percentile,
-            'num_samples': len(errors),
-            'method': 'std'  # Default to std method
+            "mean_error": mean_error,
+            "std_error": std_error,
+            "median_error": median_error,
+            "p95_error": p95,
+            "threshold": threshold_std,
+            "threshold_std": threshold_std,
+            "threshold_percentile": threshold_percentile,
+            "k_std": self.k_std,
+            "percentile": self.percentile,
+            "num_samples": int(values.size),
+            "method": "std",
         }
 
-        logger.info(f"Calibration: mean={mean_error:.4f}, std={std_error:.4f}")
-        logger.info(f"Threshold (std): {threshold_std:.4f}")
-        logger.info(f"Threshold (percentile): {threshold_percentile:.4f}")
-
+        logger.info(
+            "Calibration: mean=%.6f std=%.6f threshold_std=%.6f threshold_p%.1f=%.6f",
+            mean_error, std_error, threshold_std, self.percentile, threshold_percentile,
+        )
         return calibration_info
-
-    def save_calibration(self, calibration_info: Dict, save_path: str):
-        """
-        Save calibration information to JSON file.
-
-        Args:
-            calibration_info: Calibration statistics dictionary
-            save_path: Path to save calibration JSON
-        """
-        with open(save_path, 'w') as f:
-            json.dump(calibration_info, f, indent=2)
-
-        logger.info(f"Calibration saved to {save_path}")
 
     @staticmethod
-    def load_calibration(load_path: str) -> Dict:
-        """
-        Load calibration information from JSON file.
+    def save_calibration(calibration_info: Dict, save_path: Union[str, Path]) -> None:
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(calibration_info, handle, indent=2)
+        logger.info("Calibration saved to %s", path)
 
-        Args:
-            load_path: Path to calibration JSON file
-
-        Returns:
-            Calibration statistics dictionary
-        """
-        with open(load_path, 'r') as f:
-            calibration_info = json.load(f)
-
-        logger.info(f"Calibration loaded from {load_path}")
+    @staticmethod
+    def load_calibration(load_path: Union[str, Path]) -> Dict:
+        with open(load_path, "r", encoding="utf-8") as handle:
+            calibration_info = json.load(handle)
+        logger.info("Calibration loaded from %s", load_path)
         return calibration_info
 
 
-def calibrate_model(model: VigiLensModel,
-                   val_videos: List[Path],
-                   val_ir_videos: List[Path],
-                   device: str,
-                   checkpoint_dir: str = "checkpoints",
-                   k_std: float = 3.0) -> Dict:
-    """
-    Calibrate model and save calibration with checkpoint.
-
-    Args:
-        model: Trained VigiLens model
-        val_videos: List of validation RGB video paths
-        val_ir_videos: List of validation IR video paths
-        device: Device
-        checkpoint_dir: Directory containing model checkpoint
-        k_std: Number of standard deviations for threshold
-
-    Returns:
-        Calibration information dictionary
-    """
-    calibrator = AnomalyCalibrator(model, k_std=k_std)
-
-    # Collect errors
-    errors = calibrator.collect_errors(val_videos, val_ir_videos, device)
-
-    # Compute threshold
+def calibrate_model(model,
+                    val_videos: Sequence[Union[str, Path]],
+                    val_ir_videos: Optional[Sequence[Union[str, Path]]] = None,
+                    device: Optional[str] = None,
+                    checkpoint_dir: str = "checkpoints",
+                    k_std: float = 3.0,
+                    percentile: float = 95.0) -> Dict:
+    """Calibrate a model from cache files and save ``calibration.json``."""
+    calibrator = AnomalyCalibrator(model, k_std=k_std, percentile=percentile)
+    errors = calibrator.collect_errors(val_videos, val_ir_videos, device=device)
     calibration_info = calibrator.compute_threshold(errors)
-
-    # Save calibration
-    calibration_path = Path(checkpoint_dir) / "calibration.json"
-    calibrator.save_calibration(calibration_info, str(calibration_path))
-
+    calibrator.save_calibration(
+        calibration_info, Path(checkpoint_dir) / "calibration.json"
+    )
     return calibration_info
 
 
+def discover_caches(cache_dir: Union[str, Path]) -> List[Path]:
+    directory = Path(cache_dir)
+    if not directory.exists():
+        return []
+    return sorted(path for path in directory.rglob("*.pt") if path.is_file())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Calibrate the VigiLens anomaly threshold")
+    parser.add_argument("--cache-dir", required=True, help="Normal validation feature caches")
+    parser.add_argument("--checkpoint", required=True, help="Trained model checkpoint")
+    parser.add_argument("--output", default="checkpoints/calibration.json")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--k-std", type=float, default=3.0)
+    parser.add_argument("--percentile", type=float, default=95.0)
+    parser.add_argument("--limit", type=int, default=None, help="Use at most N cache files")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    from models.anomaly_model import VigiLensModel
+
+    caches = discover_caches(args.cache_dir)
+    if not caches:
+        raise SystemExit(f"No .pt caches found in {args.cache_dir}")
+
+    model = VigiLensModel(device=args.device, load_extractors=False)
+    model.load_checkpoint(args.checkpoint)
+    model.to(args.device)
+
+    calibrator = AnomalyCalibrator(model, k_std=args.k_std, percentile=args.percentile)
+    errors = calibrator.collect_errors_from_caches(caches, device=args.device, limit=args.limit)
+    info = calibrator.compute_threshold(errors)
+    calibrator.save_calibration(info, args.output)
+    print(json.dumps(info, indent=2))
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    from config.config import SystemConfig
-    from training.train import discover_videos, get_repo_root, pair_videos_by_sequence_id
-
-    config = SystemConfig()
-    device = config.model.device
-
-    # Load model
-    model = VigiLensModel(device=device).to(device)
-    model.load_checkpoint("checkpoints/best_model.pth")
-
-    # Discover validation videos
-    repo_root = get_repo_root()
-    data_dir = repo_root / "Data"
-    
-    val_rgb_videos = discover_videos(data_dir, "val", "rgb")
-    val_ir_videos = discover_videos(data_dir, "val", "ir")
-    
-    # Pair by sequence ID
-    val_pairs = pair_videos_by_sequence_id(val_rgb_videos, val_ir_videos)
-    val_rgb_videos = [p[0] for p in val_pairs]
-    val_ir_videos = [p[1] for p in val_pairs]
-
-    # Calibrate
-    calibration_info = calibrate_model(model, val_rgb_videos, val_ir_videos, device)
-    logger.info(f"Calibration complete: {calibration_info}")
+    main()

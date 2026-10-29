@@ -137,19 +137,21 @@ class NextFeaturePredictor(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """
-        Predict next feature from hidden state.
+        Predict the next feature from an LSTM hidden representation.
+
+        The input may be a single hidden vector ``(B, hidden_size)`` or a
+        sequence of LSTM outputs ``(B, T, hidden_size)``.  The predictor is a
+        point-wise MLP, so it is applied to the last dimension in both cases.
+        ``TemporalModel`` is responsible for selecting the last LSTM layer
+        before calling this module.
 
         Args:
-            hidden_state: LSTM hidden state (num_layers, B, hidden_size)
-                          Use the last layer's hidden state
+            hidden_state: Hidden representation with shape ``(..., hidden_size)``
 
         Returns:
-            Predicted next feature (B, output_size)
+            Predicted next feature with shape ``(..., output_size)``
         """
-        # Use last layer's hidden state
-        h_last = hidden_state[-1]  # (B, hidden_size)
-        prediction = self.predictor(h_last)
-        return prediction
+        return self.predictor(hidden_state)
 
 
 class TemporalModel(nn.Module):
@@ -197,8 +199,33 @@ class TemporalModel(nn.Module):
             Tuple of (prediction, (h, c))
         """
         output, (h, c) = self.lstm(x, hidden_state)
-        prediction = self.predictor(h)
+        # ``h`` has shape (num_layers, B, hidden_size); use the last layer.
+        prediction = self.predictor(h[-1])
         return prediction, (h, c)
+
+    def forward_sequence(self,
+                         x: torch.Tensor,
+                         hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+                         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Predict one next-feature vector for every timestep in a sequence.
+
+        This is the training/evaluation path.  It is causal: the prediction
+        at position ``t`` depends only on inputs up to and including ``t``.
+
+        Args:
+            x: Input sequence (B, T, input_size)
+            hidden_state: Optional previous hidden state
+
+        Returns:
+            predictions: (B, T, input_size)
+            hidden_state: final (h, c)
+        """
+        if x.dim() != 3:
+            raise ValueError(f"forward_sequence expects (B, T, D); got {tuple(x.shape)}")
+        output, (h, c) = self.lstm(x, hidden_state)
+        predictions = self.predictor(output)
+        return predictions, (h, c)
 
     def init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initialize hidden state."""

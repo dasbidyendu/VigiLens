@@ -1,12 +1,28 @@
-FROM python:3.7
+FROM python:3.10-slim
 
-COPY . /usr/app/
-EXPOSE 5000
-WORKDIR /usr/app/
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_PORT=8501
 
-RUN rm -f /usr/local/lib/python3.7/site-packages/setuptools-27.2.0-py3.7.egg
-RUN pip install --upgrade setuptools
-RUN pip install scikit-build
-RUN pip install -r requirements.txt
+# OpenCV and video decoding system libraries.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-CMD streamlit run app.py
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]

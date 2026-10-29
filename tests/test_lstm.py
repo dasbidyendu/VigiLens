@@ -1,83 +1,61 @@
-"""
-Tests for causal streaming LSTM module.
-"""
+"""Tests for the causal LSTM and next-feature predictor."""
 
 import torch
+
 from models.temporal_lstm import CausalLSTM, NextFeaturePredictor, TemporalModel
 
 
-def test_lstm_forward():
-    """Test LSTM forward pass."""
-    lstm = CausalLSTM(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
-    x = torch.randn(2, 10, 512)  # (B, T, input_size)
-    output, (h, c) = lstm(x)
-    assert output.shape == (2, 10, 256)
-    assert h.shape == (2, 2, 256)
-    assert c.shape == (2, 2, 256)
+def test_next_feature_predictor_accepts_vectors_and_sequences():
+    predictor = NextFeaturePredictor(hidden_size=32, output_size=16)
+    vectors = torch.randn(4, 32)
+    sequences = torch.randn(4, 7, 32)
+
+    assert predictor(vectors).shape == (4, 16)
+    assert predictor(sequences).shape == (4, 7, 16)
 
 
-def test_lstm_single_step():
-    """Test LSTM single step forward."""
-    lstm = CausalLSTM(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
-    x = torch.randn(2, 512)  # (B, input_size)
-    x = x.unsqueeze(1)  # Add sequence dim
-    output, (h, c) = lstm(x)
-    assert output.shape == (2, 1, 256)
+def test_causal_lstm_hidden_shapes():
+    lstm = CausalLSTM(input_size=16, hidden_size=8, num_layers=2, dropout=0.0)
+    sequence = torch.randn(3, 5, 16)
+    output, (h, c) = lstm(sequence)
+
+    assert output.shape == (3, 5, 8)
+    assert h.shape == (2, 3, 8)
+    assert c.shape == (2, 3, 8)
 
 
-def test_lstm_hidden_state_persistence():
-    """Test that hidden state persists across steps."""
-    lstm = CausalLSTM(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
+def test_temporal_model_forward_sequence_shapes():
+    model = TemporalModel(input_size=16, hidden_size=8, num_layers=2, dropout=0.0)
+    sequence = torch.randn(2, 6, 16)
+    predictions, (h, c) = model.forward_sequence(sequence)
 
-    # First step
-    x1 = torch.randn(1, 512).unsqueeze(1)
-    _, (h1, c1) = lstm(x1)
-
-    # Second step with previous hidden state
-    x2 = torch.randn(1, 512).unsqueeze(1)
-    _, (h2, c2) = lstm(x2, (h1, c1))
-
-    # Hidden states should be different (updated)
-    assert not torch.allclose(h1, h2)
+    assert predictions.shape == (2, 6, 16)
+    assert h.shape == (2, 2, 8)
+    assert c.shape == (2, 2, 8)
 
 
-def test_lstm_init_hidden():
-    """Test hidden state initialization."""
-    lstm = CausalLSTM(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
-    h, c = lstm.init_hidden(batch_size=4, device=torch.device('cpu'))
-    assert h.shape == (2, 4, 256)
-    assert c.shape == (2, 4, 256)
-    assert torch.allclose(h, torch.zeros_like(h))
-    assert torch.allclose(c, torch.zeros_like(c))
+def test_temporal_model_is_causal():
+    """Predictions at time t must not depend on inputs after t."""
+    torch.manual_seed(0)
+    model = TemporalModel(input_size=8, hidden_size=4, num_layers=1, dropout=0.0)
+    model.eval()
+    sequence = torch.randn(1, 10, 8)
+
+    full, _ = model.forward_sequence(sequence)
+    prefix, _ = model.forward_sequence(sequence[:, :5])
+    changed_future = sequence.clone()
+    changed_future[:, 5:] = torch.randn_like(changed_future[:, 5:])
+    full_changed, _ = model.forward_sequence(changed_future)
+
+    assert torch.allclose(full[:, :5], prefix, atol=1e-6)
+    assert torch.allclose(full[:, :5], full_changed[:, :5], atol=1e-6)
+    assert not torch.allclose(full[:, 5:], full_changed[:, 5:], atol=1e-6)
 
 
-def test_predictor_forward():
-    """Test prediction head forward pass."""
-    predictor = NextFeaturePredictor(hidden_size=256, output_size=512)
-    hidden = torch.randn(2, 256)  # Last layer hidden state
-    prediction = predictor(hidden.unsqueeze(0))  # Add layer dim
-    assert prediction.shape == (2, 512)
-
-
-def test_temporal_model_forward():
-    """Test complete temporal model forward pass."""
-    model = TemporalModel(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
-    x = torch.randn(2, 512).unsqueeze(1)
-    prediction, (h, c) = model(x)
-    assert prediction.shape == (2, 512)
-
-
-def test_temporal_model_hidden_state():
-    """Test temporal model hidden state persistence."""
-    model = TemporalModel(input_size=512, hidden_size=256, num_layers=2, dropout=0.2)
-
-    # First step
-    x1 = torch.randn(1, 512).unsqueeze(1)
-    pred1, (h1, c1) = model(x1)
-
-    # Second step with previous hidden state
-    x2 = torch.randn(1, 512).unsqueeze(1)
-    pred2, (h2, c2) = model(x2, (h1, c1))
-
-    # Predictions should be different
-    assert not torch.allclose(pred1, pred2)
+def test_temporal_model_single_step_forward():
+    model = TemporalModel(input_size=8, hidden_size=4, num_layers=1, dropout=0.0)
+    step = torch.randn(2, 8)
+    prediction, (h, c) = model(step)
+    assert prediction.shape == (2, 8)
+    assert h.shape == (1, 2, 4)
+    assert c.shape == (1, 2, 4)

@@ -1,0 +1,13 @@
+{
+  "mean_error": 0.8935179817049127,
+  "std_error": 0.006020412272249857,
+  "median_error": 0.8922894597053528,
+  "p95_error": 0.897353595495224,
+  "threshold": 0.9115792185216622,
+  "threshold_std": 0.9115792185216622,
+  "threshold_percentile": 0.897353595495224,
+  "k_std": 3.0,
+  "percentile": 95.0,
+  "num_samples": 190,
+  "method": "std"
+}

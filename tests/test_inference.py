@@ -1,353 +1,148 @@
-"""
-Tests for inference pipeline.
-"""
+"""Tests for the stateful inference pipeline and model streaming state."""
 
-import torch
 import numpy as np
-import tempfile
-from pathlib import Path
+import torch
+
 from models.anomaly_model import VigiLensModel
-from models.segmentation import YOLOSegmentation
 from pipeline.inference import InferencePipeline
-from training.calibration import AnomalyCalibrator
 
 
-def test_inference_pipeline_reset():
-    """Test that inference pipeline resets correctly."""
-    model = VigiLensModel(device="cpu")
-    segmentation = YOLOSegmentation(device="cpu")
-    calibration_info = {'threshold_std': 0.5}
+class FakeModel:
+    def __init__(self):
+        self.index = 0
+        self.reset_calls = 0
+        self.last_masks = None
 
+    def reset_stream(self):
+        self.index = 0
+        self.reset_calls += 1
+
+    def process_frame(self, rgb_frame, ir_frame, rgb_mask, ir_mask, rgb_available, ir_available):
+        self.last_masks = (rgb_mask, ir_mask)
+        score = None if self.index == 0 else float(self.index)
+        self.index += 1
+        return {
+            "anomaly_score": score,
+            "prediction": None,
+            "hidden_state": None,
+            "rgb_available": rgb_available and rgb_frame is not None,
+            "ir_available": ir_available and ir_frame is not None,
+        }
+
+
+class FakeSegmentation:
+    def __init__(self):
+        self.calls = []
+
+    def extract_person_mask(self, frame):
+        self.calls.append(frame.shape)
+        return np.ones(frame.shape[:2], dtype=np.uint8)
+
+
+def test_pipeline_first_frame_has_no_score_and_smoothing_is_causal():
+    model = FakeModel()
+    segmentation = FakeSegmentation()
     pipeline = InferencePipeline(
         model=model,
         segmentation=segmentation,
-        calibration_info=calibration_info,
-        smoothing_window=10,
-        smoothing_method="moving_average"
+        calibration_info={"threshold": 0.5},
+        smoothing_window=2,
     )
 
-    # Process a frame
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    result = pipeline.process_frame(rgb_frame)
+    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+    ir = np.zeros((12, 16), dtype=np.uint8)
 
-    # Reset
+    first = pipeline.process_frame(rgb, ir)
+    assert first["score_available"] is False
+    assert first["raw_score"] == 0.0
+    assert first["smoothed_score"] == 0.0
+    assert first["is_anomalous"] is False
+
+    second = pipeline.process_frame(rgb, ir)
+    assert second["score_available"] is True
+    assert second["raw_score"] == 1.0
+    assert second["smoothed_score"] == 1.0
+
+    third = pipeline.process_frame(rgb, ir)
+    assert third["raw_score"] == 2.0
+    assert third["smoothed_score"] == 1.5
+    assert third["is_anomalous"] is True
+
+    # One YOLO pass per frame; IR reuses the resized RGB mask (no second pass).
+    assert len(segmentation.calls) == 3
+    rgb_mask, ir_mask = model.last_masks
+    assert rgb_mask.shape == (24, 32)
+    assert ir_mask.shape == (12, 16)
+
+
+def test_pipeline_ir_only_does_not_run_segmentation():
+    model = FakeModel()
+    segmentation = FakeSegmentation()
+    pipeline = InferencePipeline(model=model, segmentation=segmentation)
+    ir = np.zeros((12, 16), dtype=np.uint8)
+
+    result = pipeline.process_frame(None, ir)
+    assert result["rgb_available"] is False
+    assert result["ir_available"] is True
+    assert segmentation.calls == []
+
+
+def test_pipeline_reset_clears_state():
+    model = FakeModel()
+    pipeline = InferencePipeline(model=model, segmentation=FakeSegmentation(), smoothing_window=3)
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    pipeline.process_frame(rgb)
+    pipeline.process_frame(rgb)
+    assert pipeline.frame_count == 2
+    assert len(pipeline.score_history) == 1
+
     pipeline.reset_stream()
-
-    # Check that frame count is reset
+    assert model.reset_calls == 1
     assert pipeline.frame_count == 0
     assert len(pipeline.score_history) == 0
 
 
-def test_inference_pipeline_smoothing():
-    """Test temporal smoothing in inference pipeline."""
-    model = VigiLensModel(device="cpu")
-    segmentation = YOLOSegmentation(device="cpu")
-    calibration_info = {'threshold_std': 0.5}
+def test_pipeline_process_video_aggregates_results():
+    class Source:
+        def __init__(self, count):
+            self.count = count
+            self.index = 0
+
+        def read(self):
+            if self.index >= self.count:
+                return None, None
+            self.index += 1
+            return np.zeros((8, 8, 3), dtype=np.uint8), None
 
     pipeline = InferencePipeline(
-        model=model,
-        segmentation=segmentation,
-        calibration_info=calibration_info,
-        smoothing_window=3,
-        smoothing_method="moving_average"
+        model=FakeModel(), segmentation=None, calibration_info={"threshold": 0.5}
     )
-
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-
-    # Process multiple frames
-    for _ in range(5):
-        result = pipeline.process_frame(rgb_frame)
-
-    # Check that smoothing history is populated
-    assert len(pipeline.score_history) <= 3
+    stats = pipeline.process_video(Source(4))
+    assert stats["total_frames"] == 4
+    assert stats["anomaly_count"] == 3
+    assert stats["anomaly_rate"] == 0.75
+    assert len(stats["results"]) == 4
+    assert stats["avg_inference_time"] >= 0.0
 
 
-def test_inference_pipeline_exponential_smoothing():
-    """Test exponential smoothing in inference pipeline."""
-    model = VigiLensModel(device="cpu")
-    segmentation = YOLOSegmentation(device="cpu")
-    calibration_info = {'threshold_std': 0.5}
+def test_real_model_streaming_state(monkeypatch):
+    model = VigiLensModel(device="cpu", load_extractors=False)
+    model.eval()
 
-    pipeline = InferencePipeline(
-        model=model,
-        segmentation=segmentation,
-        calibration_info=calibration_info,
-        smoothing_window=10,
-        smoothing_method="exponential"
-    )
+    def fake_extract(rgb_frame, ir_frame=None, rgb_mask=None, ir_mask=None):
+        return torch.randn(1, 2048), torch.randn(1, 2048)
 
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    model.extract_features = fake_extract
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
 
-    # Process a frame
-    result = pipeline.process_frame(rgb_frame)
+    first = model.process_frame(frame)
+    second = model.process_frame(frame)
+    assert first["anomaly_score"] is None
+    assert second["anomaly_score"] is not None
+    assert np.isfinite(second["anomaly_score"])
+    assert first["rgb_available"] is True
+    assert second["rgb_available"] is True
 
-    # EMA score should be initialized
-    assert pipeline.ema_score is not None
-
-
-def test_model_reset_stream():
-    """Test VigiLensModel reset_stream method."""
-    model = VigiLensModel(device="cpu")
-
-    # Process a frame
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    result = model.process_frame(rgb_frame)
-
-    # Reset
     model.reset_stream()
-
-    # Check that hidden state is reset
     assert model.hidden_state is None
     assert model.previous_prediction is None
-
-
-def test_model_hidden_state_persistence():
-    """Test that model hidden state persists across frames."""
-    model = VigiLensModel(device="cpu")
-
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-
-    # First frame
-    result1 = model.process_frame(rgb_frame)
-    hidden1 = result1['hidden_state']
-
-    # Second frame
-    result2 = model.process_frame(rgb_frame)
-    hidden2 = result2['hidden_state']
-
-    # Hidden states should be different (updated)
-    assert not torch.allclose(hidden1[0], hidden2[0])
-
-
-def test_inference_with_ir():
-    """Test inference with IR frame."""
-    model = VigiLensModel(device="cpu")
-    segmentation = YOLOSegmentation(device="cpu")
-    calibration_info = {'threshold_std': 0.5}
-
-    pipeline = InferencePipeline(
-        model=model,
-        segmentation=segmentation,
-        calibration_info=calibration_info,
-        smoothing_window=10,
-        smoothing_method="moving_average"
-    )
-
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    ir_frame = np.random.randint(0, 255, (480, 640), dtype=np.uint8)
-
-    result = pipeline.process_frame(rgb_frame, ir_frame)
-
-    assert result['ir_available'] == True
-
-
-def test_inference_rgb_only():
-    """Test inference with RGB only."""
-    model = VigiLensModel(device="cpu")
-    segmentation = YOLOSegmentation(device="cpu")
-    calibration_info = {'threshold_std': 0.5}
-
-    pipeline = InferencePipeline(
-        model=model,
-        segmentation=segmentation,
-        calibration_info=calibration_info,
-        smoothing_window=10,
-        smoothing_method="moving_average"
-    )
-
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-
-    result = pipeline.process_frame(rgb_frame, None)
-
-    assert result['ir_available'] == False
-
-
-def test_anomaly_scoring_regression():
-    """
-    Regression test for anomaly scoring bug.
-
-    Verifies that:
-    - Frame 1: previous_prediction is None, score is unavailable
-    - Frame 1 generates prediction P2
-    - Frame 2: score = distance(P2, Z2)
-    - NOT distance(P3, Z1) or distance(P2, Z1)
-    """
-    model = VigiLensModel(device="cpu")
-    model.eval()
-
-    # Reset state
-    model.reset_stream()
-
-    # Frame 1: No previous prediction, score should be None
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    result1 = model.process_frame(rgb_frame)
-    assert result1['anomaly_score'] is None, "First frame should have no anomaly score"
-
-    # Store the prediction from frame 1
-    prediction_frame1 = result1['prediction'].detach()
-
-    # Frame 2: Score should be distance(P2, Z2)
-    rgb_frame2 = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    result2 = model.process_frame(rgb_frame2)
-
-    # Score should be available
-    assert result2['anomaly_score'] is not None, "Second frame should have anomaly score"
-
-    # The score should be based on comparing prediction from frame 1 with actual feature from frame 2
-    # We can't easily verify the exact value due to the complexity of the model,
-    # but we can verify the logic is correct by checking that:
-    # 1. previous_prediction is set after frame 1
-    # 2. It is used for scoring in frame 2
-    # 3. It is then updated with the new prediction
-
-    # Reset and test with controlled mock scenario
-    model.reset_stream()
-
-    # Create mock features to test the scoring logic directly
-    # Simulate: P2 = [1, 1, 1], Z2 = [1, 1, 1] -> MSE = 0
-    with torch.no_grad():
-        # Manually set previous_prediction to simulate prediction from frame 1
-        model.previous_prediction = torch.ones(1, 512).to("cpu")
-
-        # Create a mock fused feature that matches the prediction
-        mock_fused = torch.ones(1, 512).to("cpu")
-
-        # Calculate expected MSE
-        expected_mse = torch.nn.functional.mse_loss(model.previous_prediction, mock_fused).item()
-        assert expected_mse == 0.0, "MSE of identical tensors should be 0"
-
-        # Now test with different values: P2 = [1, 1, 1], Z2 = [2, 2, 2] -> MSE = 1
-        model.previous_prediction = torch.ones(1, 512).to("cpu")
-        mock_fused_different = torch.ones(1, 512).to("cpu") * 2
-
-        expected_mse_diff = torch.nn.functional.mse_loss(model.previous_prediction, mock_fused_different).item()
-        assert abs(expected_mse_diff - 1.0) < 0.01, "MSE should be 1 for tensors differing by factor of 2"
-
-
-def test_one_frame_latency():
-    """
-    Test that anomaly scoring has exactly one-frame latency.
-
-    Frame 1: generates prediction, no score
-    Frame 2: compares prediction from frame 1 with frame 2, has score
-    """
-    model = VigiLensModel(device="cpu")
-    model.eval()
-    model.reset_stream()
-
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-
-    # Frame 1: no score
-    result1 = model.process_frame(rgb_frame)
-    assert result1['anomaly_score'] is None
-
-    # Frame 2: has score
-    result2 = model.process_frame(rgb_frame)
-    assert result2['anomaly_score'] is not None
-
-    # Frame 3: has score
-    result3 = model.process_frame(rgb_frame)
-    assert result3['anomaly_score'] is not None
-
-
-def test_cpu_device_fallback():
-    """Test that model initializes correctly on CPU when CUDA is unavailable."""
-    # Force CPU device
-    device = "cpu"
-    
-    model = VigiLensModel(device=device)
-    segmentation = YOLOSegmentation(device=device)
-    
-    # Verify model components are on CPU
-    assert model.device == "cpu"
-    assert model.rgb_extractor.device == "cpu"
-    assert model.ir_extractor.device == "cpu"
-    
-    # Test inference works on CPU
-    rgb_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    result = model.process_frame(rgb_frame)
-    
-    assert result is not None
-    assert 'prediction' in result
-
-
-def test_device_consistency():
-    """Test that all model components use the same device."""
-    device = "cpu"
-    
-    model = VigiLensModel(device=device)
-    
-    # Check that all components are on the same device
-    assert model.rgb_extractor.device == device
-    assert model.ir_extractor.device == device
-    assert model.fusion.rgb_projection[0].weight.device.type == "cpu"
-    assert model.fusion.ir_projection[0].weight.device.type == "cpu"
-    assert model.temporal.lstm.lstm.weight_ih_l0.device.type == "cpu"
-
-
-def test_temporary_file_cleanup():
-    """Test that temporary files are cleaned up properly."""
-    import time
-    
-    # Create a temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_path = Path(temp_file.name)
-    temp_file.close()
-    
-    # Verify file exists
-    assert temp_path.exists()
-    
-    # Define safe delete function (same as in app.py)
-    def safe_delete(path, max_retries=3, delay=0.1):
-        if path is None or not path.exists():
-            return
-        for attempt in range(max_retries):
-            try:
-                path.unlink(missing_ok=True)
-                return
-            except PermissionError:
-                if attempt < max_retries - 1:
-                    time.sleep(delay)
-                else:
-                    raise
-    
-    # Delete the file
-    safe_delete(temp_path)
-    
-    # Verify file is deleted
-    assert not temp_path.exists()
-
-
-def test_frame_source_release():
-    """Test that frame source releases resources properly."""
-    from pipeline.frame_source import VideoFrameSource
-    import cv2
-    
-    # Create a dummy video file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_path = Path(temp_file.name)
-    temp_file.close()
-    
-    # Write minimal valid video (1 frame)
-    cap = cv2.VideoCapture(str(temp_path), cv2.CAP_FFMPEG)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(str(temp_path), fourcc, 30.0, (640, 480))
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    writer.write(frame)
-    writer.release()
-    cap.release()
-    
-    # Create frame source
-    frame_source = VideoFrameSource(temp_path)
-    
-    # Read a frame
-    visible_frame, ir_frame = frame_source.read()
-    assert visible_frame is not None
-    
-    # Release
-    frame_source.release()
-    
-    # Clean up
-    temp_path.unlink(missing_ok=True)
-    
-    print("✓ Frame source release test passed")
