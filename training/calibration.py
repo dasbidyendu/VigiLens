@@ -5,23 +5,80 @@ Calibration collects prediction errors on held-out **normal** videos and sets
 the anomaly threshold to ``mean + k * std`` (with a percentile alternative).
 The threshold is saved as JSON next to the model checkpoint and is loaded by
 the Streamlit app and by offline evaluation.
+
+The app compares a *smoothed* score with the threshold, and smoothing shrinks
+the spread of normal scores, so a threshold computed on raw errors would sit
+in the wrong place.  Calibration therefore stores one threshold per smoothing
+setting (``thresholds["moving_average"]["<window>"]`` for windows 1-30 and
+``thresholds["exponential"]["<alpha>"]``), computed on exactly the smoothed
+scores the app produces.  Use :func:`threshold_for` to pick the right one.
+
+The file also records the SHA-256 of the checkpoint it was computed for, so
+the app can refuse a calibration that belongs to a different model.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from training.scoring import prediction_errors
+from training.scoring import prediction_errors, raw_score_sequences, smooth_scores
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_WINDOWS = tuple(range(1, 31))
+DEFAULT_EMA_ALPHAS = (0.1, 0.2, 0.3, 0.5)
+
+
+def file_sha256(path: Union[str, Path]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _alpha_key(alpha: float) -> str:
+    return f"{float(alpha):g}"
+
+
+def threshold_for(calibration: Optional[Dict],
+                  method: str = "moving_average",
+                  window: int = 1,
+                  ema_alpha: float = 0.3,
+                  fallback: Optional[float] = None) -> Tuple[Optional[float], str]:
+    """
+    Return ``(threshold, source)`` for a smoothing setting.
+
+    ``source`` is ``"matched"`` when the calibration contains a threshold for
+    exactly this setting, ``"raw"`` when only the legacy single raw-score
+    threshold is available, and ``"default"`` when ``fallback`` was used.
+    """
+    calibration = calibration or {}
+    table = calibration.get("thresholds") or {}
+    if method == "moving_average":
+        key = str(max(1, int(window)))
+        value = (table.get("moving_average") or {}).get(key)
+        if value is None and int(window) <= 1:
+            value = calibration.get("threshold_raw")
+    elif method == "exponential":
+        value = (table.get("exponential") or {}).get(_alpha_key(ema_alpha))
+    else:
+        value = (table.get("moving_average") or {}).get("1", calibration.get("threshold_raw"))
+    if value is not None:
+        return float(value), "matched"
+    legacy = calibration.get("threshold_raw", calibration.get("threshold", calibration.get("threshold_std")))
+    if legacy is not None:
+        return float(legacy), "raw"
+    return (float(fallback) if fallback is not None else None), "default"
 
 
 class AnomalyCalibrator:
@@ -79,8 +136,39 @@ class AnomalyCalibrator:
             "or use `--cache-dir`."
         )
 
+    def _stats(self, values: np.ndarray) -> Tuple[float, float]:
+        values = values[np.isfinite(values)]
+        return (float(np.mean(values) + self.k_std * np.std(values)),
+                float(np.percentile(values, self.percentile)))
+
+    def compute_smoothed_thresholds(self,
+                                    raw_sequences: Sequence[np.ndarray],
+                                    windows: Sequence[int] = DEFAULT_WINDOWS,
+                                    ema_alphas: Sequence[float] = DEFAULT_EMA_ALPHAS) -> Dict:
+        """
+        Thresholds for every smoothing setting the app offers.
+
+        Each sequence is one video's raw scores, with frame 0 as the unscored
+        placeholder; smoothing restarts per video exactly like the app.
+        """
+        sequences = [np.asarray(seq, dtype=np.float32).reshape(-1) for seq in raw_sequences]
+        sequences = [seq for seq in sequences if seq.size > 1]
+        if not sequences:
+            raise ValueError("Cannot calibrate: no video has more than one scored frame")
+
+        table = {"moving_average": {}, "exponential": {}}
+        percentiles = {"moving_average": {}, "exponential": {}}
+        for window in windows:
+            values = np.concatenate([smooth_scores(seq, "moving_average", int(window))[1:] for seq in sequences])
+            table["moving_average"][str(int(window))], percentiles["moving_average"][str(int(window))] = self._stats(values)
+        for alpha in ema_alphas:
+            values = np.concatenate([smooth_scores(seq, "exponential", 1, float(alpha))[1:] for seq in sequences])
+            key = _alpha_key(alpha)
+            table["exponential"][key], percentiles["exponential"][key] = self._stats(values)
+        return {"thresholds": table, "thresholds_percentile": percentiles}
+
     def compute_threshold(self, errors: Sequence[float]) -> Dict:
-        """Compute calibration statistics from normal prediction errors."""
+        """Compute calibration statistics from normal (raw) prediction errors."""
         values = np.asarray(errors, dtype=np.float64).reshape(-1)
         values = values[np.isfinite(values)]
         if values.size == 0:
@@ -99,6 +187,7 @@ class AnomalyCalibrator:
             "median_error": median_error,
             "p95_error": p95,
             "threshold": threshold_std,
+            "threshold_raw": threshold_std,
             "threshold_std": threshold_std,
             "threshold_percentile": threshold_percentile,
             "k_std": self.k_std,
@@ -127,6 +216,38 @@ class AnomalyCalibrator:
             calibration_info = json.load(handle)
         logger.info("Calibration loaded from %s", load_path)
         return calibration_info
+
+
+def calibrate_from_caches(model,
+                          cache_paths: Sequence[Union[str, Path]],
+                          device: Optional[str] = None,
+                          output_path: Optional[Union[str, Path]] = None,
+                          checkpoint_path: Optional[Union[str, Path]] = None,
+                          k_std: float = 3.0,
+                          percentile: float = 95.0,
+                          limit: Optional[int] = None) -> Dict:
+    """Full calibration: raw stats + per-smoothing thresholds + provenance."""
+    cache_paths = [Path(path) for path in cache_paths]
+    if limit is not None:
+        cache_paths = cache_paths[:limit]
+    if not cache_paths:
+        raise ValueError("No cache files were provided for calibration")
+
+    model.eval()
+    calibrator = AnomalyCalibrator(model, k_std=k_std, percentile=percentile)
+    sequences = raw_score_sequences(model, tqdm(cache_paths, desc="Calibrating"), device=device)
+    raw_errors = np.concatenate([seq[1:] for seq in sequences if seq.size > 1]) if sequences else np.zeros(0)
+    info = calibrator.compute_threshold(raw_errors)
+    info.update(calibrator.compute_smoothed_thresholds(sequences))
+    info["num_videos"] = len(sequences)
+    info["context_length"] = getattr(model, "context_length", None)
+    info["cache_files"] = [path.name for path in cache_paths]
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        info["checkpoint"] = str(checkpoint_path)
+        info["checkpoint_sha256"] = file_sha256(checkpoint_path)
+    if output_path is not None:
+        AnomalyCalibrator.save_calibration(info, output_path)
+    return info
 
 
 def calibrate_model(model,
@@ -176,11 +297,13 @@ def main() -> None:
     model.load_checkpoint(args.checkpoint)
     model.to(args.device)
 
-    calibrator = AnomalyCalibrator(model, k_std=args.k_std, percentile=args.percentile)
-    errors = calibrator.collect_errors_from_caches(caches, device=args.device, limit=args.limit)
-    info = calibrator.compute_threshold(errors)
-    calibrator.save_calibration(info, args.output)
-    print(json.dumps(info, indent=2))
+    info = calibrate_from_caches(
+        model, caches, device=args.device, output_path=args.output,
+        checkpoint_path=args.checkpoint, k_std=args.k_std,
+        percentile=args.percentile, limit=args.limit,
+    )
+    print(json.dumps({k: v for k, v in info.items()
+                      if k not in ("thresholds", "thresholds_percentile", "cache_files")}, indent=2))
 
 
 if __name__ == "__main__":

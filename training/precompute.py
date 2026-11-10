@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from models.mask_stabilizer import MaskStabilizer
 from training.utils import (
     IMAGE_EXTENSIONS,
     discover_videos,
@@ -107,12 +108,44 @@ def _resize_mask(mask: Optional[np.ndarray], frame: np.ndarray) -> Optional[np.n
     return (mask > 0).astype(np.uint8)
 
 
-def _open_capture(path: Path) -> Optional[cv2.VideoCapture]:
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        capture.release()
+def _open_source(rgb_path: Path, ir_path: Optional[Path]):
+    """
+    Open the same frame source the app uses, so IR frames are paired with RGB
+    frames by timestamp (FPS mapping) in training exactly as at inference.
+    """
+    from pipeline.frame_source import SingleVideoSource, VideoFrameSource
+
+    try:
+        if ir_path is None:
+            return SingleVideoSource(rgb_path)
+        return VideoFrameSource(rgb_path, ir_path)
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise ValueError(f"Cannot open RGB video: {rgb_path} ({exc})") from exc
+
+
+def _cache_settings(rgb_path: Path, ir_path: Optional[Path], segmentation, max_frames,
+                    frame_stride: int, start_frame: int, mask_hold_frames: int,
+                    save_half: bool) -> Dict[str, Any]:
+    """Everything that changes the cached features; stored in the sidecar."""
+    return {
+        "source_rgb": str(rgb_path),
+        "source_ir": str(ir_path) if ir_path is not None else None,
+        "segmentation": segmentation is not None,
+        "max_frames": max_frames,
+        "frame_stride": int(frame_stride),
+        "start_frame": int(start_frame),
+        "mask_hold_frames": int(mask_hold_frames) if segmentation is not None else 0,
+        "ir_pairing": "fps",
+        "dtype": "float16" if save_half else "float32",
+    }
+
+
+def _existing_settings(sidecar_path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as handle:
+            return json.load(handle).get("settings")
+    except (OSError, json.JSONDecodeError):
         return None
-    return capture
 
 
 def precompute_pair(rgb_path: Union[str, Path],
@@ -129,12 +162,15 @@ def precompute_pair(rgb_path: Union[str, Path],
                     label_spec: Optional[Dict[str, Any]] = None,
                     label_base_dir: Optional[Union[str, Path]] = None,
                     save_half: bool = False,
-                    overwrite: bool = False) -> Optional[Path]:
+                    overwrite: bool = False,
+                    mask_hold_frames: int = 5) -> Optional[Path]:
     """
     Extract and save features for one RGB/IR video pair.
 
-    Returns the cache path, or ``None`` when the cache already exists and
-    ``overwrite`` is false.
+    An existing cache is reused only when it was built from the same source
+    files with the same settings (stride, max frames, segmentation, ...);
+    otherwise it is rebuilt.  Returns the cache path, or ``None`` when no
+    frame could be processed.
     """
     if rgb_extractor is None or ir_extractor is None:
         raise ValueError("rgb_extractor and ir_extractor are required")
@@ -145,32 +181,35 @@ def precompute_pair(rgb_path: Union[str, Path],
     sequence_id = sequence_id or extract_sequence_id(rgb_path)
     cache_path = output_dir / f"{safe_stem(sequence_id)}.pt"
     sidecar_path = cache_path.with_suffix(".json")
+    frame_stride = max(1, int(frame_stride))
+    start_frame = max(0, int(start_frame))
+    max_frames = int(max_frames) if max_frames is not None else None
+    settings = _cache_settings(rgb_path, ir_path, segmentation, max_frames,
+                               frame_stride, start_frame, mask_hold_frames, save_half)
     if cache_path.exists() and not overwrite:
-        logger.info("Skipping existing cache: %s", cache_path)
-        return cache_path
+        if _existing_settings(sidecar_path) == settings:
+            logger.info("Skipping existing cache: %s", cache_path)
+            return cache_path
+        logger.warning("Existing cache %s was built with different settings or sources; rebuilding",
+                       cache_path)
 
-    rgb_cap = _open_capture(rgb_path)
-    if rgb_cap is None:
-        raise ValueError(f"Cannot open RGB video: {rgb_path}")
-
-    ir_cap = _open_capture(ir_path) if ir_path is not None else None
-    if ir_path is not None and ir_cap is None:
+    source = _open_source(rgb_path, ir_path)
+    if ir_path is not None and not source.ir_available:
         logger.warning("Cannot open IR video %s; using RGB only", ir_path)
 
-    fps = float(rgb_cap.get(cv2.CAP_PROP_FPS))
+    fps = float(getattr(source, "visible_fps", 0.0) or 0.0)
     if not np.isfinite(fps) or fps <= 0:
         fps = 20.0
 
     resolver = LabelResolver(label_spec, Path(label_base_dir or "."))
-    frame_stride = max(1, int(frame_stride))
-    start_frame = max(0, int(start_frame))
-    max_frames = int(max_frames) if max_frames is not None else None
+    stabilizer = MaskStabilizer(mask_hold_frames)
 
     rgb_features: List[np.ndarray] = []
     ir_features: List[np.ndarray] = []
     frame_indices: List[int] = []
     labels: List[int] = []
-    has_ir = ir_cap is not None
+    person_detected: List[bool] = []
+    has_ir = bool(source.ir_available)
     input_index = 0
     batch_frames_rgb: List[np.ndarray] = []
     batch_frames_ir: List[np.ndarray] = []
@@ -183,7 +222,10 @@ def precompute_pair(rgb_path: Union[str, Path],
             return
         masks = None
         if segmentation is not None:
-            masks = segmentation.extract_person_masks(batch_frames_rgb)
+            detections = segmentation.extract_person_masks(batch_frames_rgb)
+            person_detected.extend(mask is not None for mask in detections)
+            # Same gap-filling rule as the streaming pipeline.
+            masks = stabilizer.update_many(detections)
 
         rgb_feats = rgb_extractor.extract_batch(batch_frames_rgb, masks)
         rgb_features.extend(list(rgb_feats))
@@ -209,27 +251,24 @@ def precompute_pair(rgb_path: Union[str, Path],
             if max_frames is not None and len(frame_indices) + len(batch_indices) >= max_frames:
                 break
 
-            ret_rgb, rgb_frame = rgb_cap.read()
-            if not ret_rgb:
+            # Every frame is read (even with a stride) so the FPS-based IR
+            # pairing advances exactly as in VideoFrameSource at inference.
+            rgb_frame, ir_frame = source.read()
+            if rgb_frame is None:
                 break
-
-            ret_ir, ir_frame = (True, None)
-            if ir_cap is not None:
-                ret_ir, ir_frame = ir_cap.read()
 
             current_index = input_index
             input_index += 1
+
+            if has_ir and ir_frame is None:
+                logger.warning("IR video ended at frame %d; truncating pair %s", current_index, sequence_id)
+                has_ir = False
+                break
+
             if current_index < start_frame:
                 continue
             if (current_index - start_frame) % frame_stride != 0:
                 continue
-
-            if ir_cap is not None and not ret_ir:
-                logger.warning("IR video ended at frame %d; truncating pair %s", current_index, sequence_id)
-                has_ir = False
-                ir_cap.release()
-                ir_cap = None
-                break
 
             batch_frames_rgb.append(rgb_frame)
             if has_ir and ir_frame is not None:
@@ -240,9 +279,7 @@ def precompute_pair(rgb_path: Union[str, Path],
             if len(batch_frames_rgb) >= max(1, int(batch_size)):
                 flush_batch()
     finally:
-        rgb_cap.release()
-        if ir_cap is not None:
-            ir_cap.release()
+        source.release()
 
     flush_batch()
 
@@ -274,6 +311,7 @@ def precompute_pair(rgb_path: Union[str, Path],
         "source_ir": str(ir_path) if ir_path is not None else None,
         "frame_stride": frame_stride,
         "start_frame": start_frame,
+        "person_detected": person_detected if segmentation is not None else None,
         "dtype": "float16" if save_half else "float32",
     }
     torch.save(data, cache_path)
@@ -288,7 +326,14 @@ def precompute_pair(rgb_path: Union[str, Path],
         "frame_stride": frame_stride,
         "start_frame": start_frame,
         "dtype": data["dtype"],
+        "person_detection_rate": (float(np.mean(person_detected)) if person_detected else None),
+        "settings": settings,
     }
+    if frame_stride > 1:
+        logger.warning(
+            "%s cached with frame_stride=%d: the model will learn %dx faster motion "
+            "than the app sees (the app scores every frame).", sequence_id, frame_stride, frame_stride,
+        )
     with open(sidecar_path, "w", encoding="utf-8") as handle:
         json.dump(sidecar, handle, indent=2)
 
@@ -314,7 +359,8 @@ def precompute_manifest(manifest_path: Union[str, Path],
                         frame_stride: int = 1,
                         save_half: bool = False,
                         overwrite: bool = False,
-                        limit: Optional[int] = None) -> List[Path]:
+                        limit: Optional[int] = None,
+                        mask_hold_frames: int = 5) -> List[Path]:
     """Precompute caches for every video in an evaluation manifest."""
     manifest_path = Path(manifest_path)
     with open(manifest_path, "r", encoding="utf-8") as handle:
@@ -349,6 +395,7 @@ def precompute_manifest(manifest_path: Union[str, Path],
             label_base_dir=base_dir,
             save_half=save_half,
             overwrite=overwrite,
+            mask_hold_frames=mask_hold_frames,
         )
         if cache_path is not None:
             cache_paths.append(cache_path)
@@ -372,7 +419,8 @@ def precompute_data_dir(data_dir: Union[str, Path],
                         max_frames: Optional[int] = None,
                         frame_stride: int = 1,
                         save_half: bool = False,
-                        overwrite: bool = False) -> List[Path]:
+                        overwrite: bool = False,
+                        mask_hold_frames: int = 5) -> List[Path]:
     """Precompute caches for ``Data/<split>/rgb`` and ``Data/<split>/ir``."""
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
@@ -406,6 +454,7 @@ def precompute_data_dir(data_dir: Union[str, Path],
                 frame_stride=frame_stride,
                 save_half=save_half,
                 overwrite=overwrite,
+                mask_hold_frames=mask_hold_frames,
             )
             if cache_path is not None:
                 cache_paths.append(cache_path)
@@ -438,6 +487,9 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-segmentation", action="store_true", help="Use full frames (no YOLO)")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--mask-hold", type=int, default=5,
+                        help="Reuse the last person mask for up to N missed detections "
+                             "(must match config.inference.mask_hold_frames)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -463,6 +515,7 @@ def main() -> None:
             save_half=args.save_half,
             overwrite=args.overwrite,
             limit=args.limit,
+            mask_hold_frames=args.mask_hold,
         )
     else:
         paths = precompute_data_dir(
@@ -477,6 +530,7 @@ def main() -> None:
             frame_stride=args.frame_stride,
             save_half=args.save_half,
             overwrite=args.overwrite,
+            mask_hold_frames=args.mask_hold,
         )
 
     print(json.dumps({"caches": [str(path) for path in paths], "count": len(paths)}, indent=2))

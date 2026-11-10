@@ -29,7 +29,13 @@ Labels can be supplied in three ways (in priority order):
 2. ``segments``: a list of ``[start, end)`` anomalous frame intervals.
 3. ``label``: ``"normal"`` / ``"anomaly"`` for the whole video.
 
-If none are present, the labels stored in the precomputed cache are used.
+All three are expressed in *original video frame numbers* and are mapped
+through the cache's ``frame_indices``, so they stay aligned when features were
+cached with ``--frame-stride`` or a ``start_frame``.  If the entry has none of
+them, the labels stored in the cache are used.
+
+Frame 0 of every video has no prediction (its score is a 0.0 placeholder) and
+is excluded from all metrics.
 
 Metrics are frame-level ROC-AUC, average precision, precision/recall/F1 at a
 threshold, FPR, and FPR at 95% TPR.  A normal-only manifest is valid: AUC/AP
@@ -48,6 +54,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import torch
 
+from training.calibration import threshold_for
 from training.metrics import compute_binary_metrics, compute_video_metrics
 from training.scoring import read_cache_metadata, score_cache_file
 from training.utils import safe_stem
@@ -96,22 +103,38 @@ def _align_labels(labels: np.ndarray, num_frames: int) -> np.ndarray:
 def labels_for_entry(entry: Dict[str, Any],
                      num_frames: int,
                      base_dir: Path,
-                     cache_labels: Optional[np.ndarray] = None) -> np.ndarray:
-    """Resolve frame labels for one manifest entry."""
+                     cache_labels: Optional[np.ndarray] = None,
+                     frame_indices: Optional[Sequence[int]] = None) -> np.ndarray:
+    """
+    Resolve labels for the ``num_frames`` cached frames of one entry.
+
+    ``frame_indices[i]`` is the original video frame number of cached frame
+    ``i``; when omitted, cached frame ``i`` is assumed to be video frame ``i``.
+    """
+    if frame_indices is None or len(frame_indices) != num_frames:
+        if frame_indices is not None:
+            logger.warning("frame_indices length %d != %d frames; assuming contiguous frames",
+                           len(frame_indices), num_frames)
+        frame_indices = np.arange(num_frames)
+    frame_indices = np.asarray(frame_indices, dtype=np.int64)
+
     if entry.get("frame_labels"):
         path = _resolve(base_dir, entry["frame_labels"])
         labels = _load_label_file(path)
-        return _align_labels(labels, num_frames)
+        if frame_indices.size and int(frame_indices.max()) >= labels.size:
+            logger.warning("Label file %s has %d labels but frames go up to %d; padding with 0",
+                           path, labels.size, int(frame_indices.max()))
+            labels = np.pad(labels, (0, int(frame_indices.max()) + 1 - labels.size))
+        return labels[frame_indices]
 
-    if "segments" in entry:
+    segments = entry.get("segments")
+    if segments:
         labels = np.zeros(num_frames, dtype=np.int64)
-        for segment in entry.get("segments") or []:
+        for segment in segments:
             if len(segment) != 2:
                 raise ValueError(f"Invalid segment {segment}; expected [start, end]")
-            start = max(0, int(segment[0]))
-            end = min(num_frames, int(segment[1]))
-            if end > start:
-                labels[start:end] = 1
+            start, end = int(segment[0]), int(segment[1])
+            labels |= ((frame_indices >= start) & (frame_indices < end)).astype(np.int64)
         return labels
 
     if "label" in entry:
@@ -161,7 +184,10 @@ def evaluate_manifest(model,
                       smoothing_window: int = 1,
                       chunk_size: int = 256,
                       device: Optional[Union[str, torch.device]] = None,
-                      write_csv: bool = True) -> Dict[str, Any]:
+                      write_csv: bool = True,
+                      smoothing_method: str = "moving_average",
+                      ema_alpha: float = 0.3,
+                      default_threshold: float = 0.5) -> Dict[str, Any]:
     """Score a manifest and write per-frame scores plus a JSON summary."""
     manifest_path = Path(manifest_path)
     base_dir = manifest_path.parent
@@ -182,14 +208,24 @@ def evaluate_manifest(model,
             with open(mapping_path, "r", encoding="utf-8") as handle:
                 cache_mapping = json.load(handle)
 
+    smoothed_eval = smoothing_method == "exponential" or smoothing_window > 1
     calibration = None
+    threshold_source = "explicit" if threshold is not None else "default"
     if calibration_path is not None and Path(calibration_path).exists():
         with open(calibration_path, "r", encoding="utf-8") as handle:
             calibration = json.load(handle)
         if threshold is None:
-            threshold = calibration.get("threshold", calibration.get("threshold_std"))
+            # Pick the threshold calibrated for the same smoothing setting.
+            threshold, threshold_source = threshold_for(
+                calibration, smoothing_method if smoothed_eval else "moving_average",
+                smoothing_window if smoothed_eval else 1, ema_alpha,
+            )
+            if threshold_source == "raw" and smoothed_eval:
+                logger.warning("Calibration has no threshold for this smoothing setting; "
+                               "using the raw-score threshold (re-run calibration).")
     if threshold is None:
-        threshold = 0.5
+        threshold = default_threshold
+        threshold_source = "default"
 
     if hasattr(model, "eval"):
         model.eval()
@@ -212,15 +248,19 @@ def evaluate_manifest(model,
             smoothing_window=smoothing_window,
             chunk_size=chunk_size,
             device=device,
+            smoothing_method=smoothing_method,
+            ema_alpha=ema_alpha,
         )
         labels = labels_for_entry(
-            entry, result["num_frames"], base_dir, result.get("labels")
+            entry, result["num_frames"], base_dir, result.get("labels"),
+            result.get("frame_indices"),
         )
         sequence_id = entry.get("sequence_id", result["sequence_id"])
 
-        all_raw.append(result["raw_scores"])
-        all_smoothed.append(result["smoothed_scores"])
-        all_labels.append(labels)
+        # Frame 0 has no prediction; keep it out of every metric.
+        all_raw.append(result["raw_scores"][1:])
+        all_smoothed.append(result["smoothed_scores"][1:])
+        all_labels.append(labels[1:])
 
         video_label = int(labels.any())
         per_video.append({
@@ -234,10 +274,15 @@ def evaluate_manifest(model,
             "has_ir": bool(result["has_ir"]),
         })
 
-        for frame_index in range(result["num_frames"]):
+        frame_numbers = result.get("frame_indices")
+        if frame_numbers is None or len(frame_numbers) != result["num_frames"]:
+            frame_numbers = range(result["num_frames"])
+        for frame_index, video_frame in enumerate(frame_numbers):
             csv_rows.append({
                 "sequence_id": sequence_id,
                 "frame_index": frame_index,
+                "video_frame": int(video_frame),
+                "scored": int(frame_index > 0),
                 "raw_score": float(result["raw_scores"][frame_index]),
                 "smoothed_score": float(result["smoothed_scores"][frame_index]),
                 "label": int(labels[frame_index]),
@@ -246,8 +291,8 @@ def evaluate_manifest(model,
     raw_scores = np.concatenate(all_raw)
     smoothed_scores = np.concatenate(all_smoothed)
     labels = np.concatenate(all_labels)
-    primary_scores = smoothed_scores if smoothing_window > 1 else raw_scores
-    score_type = "smoothed" if smoothing_window > 1 else "raw"
+    primary_scores = smoothed_scores if smoothed_eval else raw_scores
+    score_type = "smoothed" if smoothed_eval else "raw"
 
     metrics = compute_binary_metrics(labels, primary_scores, threshold=threshold)
     metrics_raw = compute_binary_metrics(labels, raw_scores, threshold=threshold)
@@ -259,7 +304,7 @@ def evaluate_manifest(model,
     best_metrics = compute_binary_metrics(labels, primary_scores, threshold=None)
     video_metrics = compute_video_metrics(
         [video["label"] for video in per_video],
-        [video["max_smoothed_score"] if smoothing_window > 1 else video["max_raw_score"] for video in per_video],
+        [video["max_smoothed_score"] if smoothed_eval else video["max_raw_score"] for video in per_video],
     )
 
     summary = {
@@ -269,7 +314,9 @@ def evaluate_manifest(model,
         "num_frames": int(labels.size),
         "score_type": score_type,
         "smoothing_window": int(smoothing_window),
+        "smoothing_method": smoothing_method,
         "threshold": float(threshold),
+        "threshold_source": threshold_source,
         "calibration": calibration,
         "metrics": metrics,
         "metrics_raw": metrics_raw,
@@ -279,7 +326,9 @@ def evaluate_manifest(model,
         "per_video": per_video,
         "notes": (
             "AUC/AP are NaN when the evaluation set contains only one class. "
-            "FPR is still valid for a normal-only smoke test."
+            "FPR is still valid for a normal-only smoke test. "
+            "metrics_at_best_f1_threshold picks the threshold on this same test "
+            "set (an optimistic upper bound), so report the calibrated metrics."
         ),
     }
 
@@ -289,7 +338,8 @@ def evaluate_manifest(model,
         with open(scores_csv, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["sequence_id", "frame_index", "raw_score", "smoothed_score", "label"],
+                fieldnames=["sequence_id", "frame_index", "video_frame", "scored",
+                            "raw_score", "smoothed_score", "label"],
             )
             writer.writeheader()
             writer.writerows(csv_rows)
@@ -305,7 +355,8 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     print("\nVigiLens evaluation")
     print("=" * 60)
     print(f"Videos: {summary['num_videos']}  Frames: {summary['num_frames']}")
-    print(f"Score type: {summary['score_type']}  Threshold: {summary['threshold']:.6f}")
+    print(f"Score type: {summary['score_type']}  Threshold: {summary['threshold']:.6f} "
+          f"({summary.get('threshold_source', '?')})")
     print(f"AUC: {metrics['auc']:.4f}" if np.isfinite(metrics["auc"]) else "AUC: n/a (single class)")
     print(f"AP:  {metrics['ap']:.4f}" if np.isfinite(metrics["ap"]) else "AP:  n/a (single class)")
     print(
@@ -329,6 +380,9 @@ def main() -> None:
     parser.add_argument("--calibration", default=None)
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--smoothing-window", type=int, default=1)
+    parser.add_argument("--smoothing-method", choices=["moving_average", "exponential"],
+                        default="moving_average")
+    parser.add_argument("--ema-alpha", type=float, default=0.3)
     parser.add_argument("--chunk-size", type=int, default=256)
     parser.add_argument("--output-dir", default="Evaluation/results")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -354,6 +408,8 @@ def main() -> None:
         chunk_size=args.chunk_size,
         device=args.device,
         write_csv=not args.no_csv,
+        smoothing_method=args.smoothing_method,
+        ema_alpha=args.ema_alpha,
     )
     _print_summary(summary)
 

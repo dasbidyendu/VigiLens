@@ -24,8 +24,9 @@ import cv2
 import numpy as np
 
 from models.anomaly_model import VigiLensModel
-from models.segmentation import YOLOSegmentation
+from models.mask_stabilizer import MaskStabilizer
 from pipeline.frame_source import MultimodalFrameSource
+from training.calibration import threshold_for
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +36,42 @@ class InferencePipeline:
 
     def __init__(self,
                  model: VigiLensModel,
-                 segmentation: Optional[YOLOSegmentation],
+                 segmentation,
                  calibration_info: Optional[Dict] = None,
                  smoothing_window: int = 10,
                  smoothing_method: str = "moving_average",
                  threshold: Optional[float] = None,
-                 ema_alpha: float = 0.3):
+                 ema_alpha: float = 0.3,
+                 default_threshold: float = 0.5,
+                 mask_hold_frames: int = 5):
         self.model = model
         self.segmentation = segmentation
         self.calibration_info = calibration_info or {}
         self.smoothing_window = max(1, int(smoothing_window))
         self.smoothing_method = smoothing_method
         self.ema_alpha = float(ema_alpha)
+        self.mask_stabilizer = MaskStabilizer(mask_hold_frames)
 
-        calibrated = self.calibration_info.get(
-            "threshold", self.calibration_info.get("threshold_std", 0.5)
+        # The threshold must be calibrated on the same smoothed score that is
+        # compared against it (see training.calibration.threshold_for).
+        calibrated, source = threshold_for(
+            self.calibration_info, smoothing_method, self.smoothing_window,
+            self.ema_alpha, fallback=default_threshold,
         )
-        self.threshold = float(threshold if threshold is not None else calibrated)
+        if threshold is not None:
+            calibrated, source = float(threshold), "explicit"
+        self.threshold = float(calibrated)
         self.default_threshold = float(calibrated)
+        self.threshold_source = source
+        if source == "raw" and (smoothing_method != "moving_average" or self.smoothing_window > 1):
+            logger.warning(
+                "Calibration has only a raw-score threshold but scores are smoothed "
+                "(%s/%d); re-run calibration for a matching threshold.",
+                smoothing_method, self.smoothing_window,
+            )
+        elif source == "default":
+            logger.warning("No calibration available; using the uncalibrated default threshold %.4f",
+                           self.threshold)
 
         self.score_history: deque = deque(maxlen=self.smoothing_window)
         self.ema_score: Optional[float] = None
@@ -74,6 +93,7 @@ class InferencePipeline:
         self.frame_count = 0
         self.total_inference_time = 0.0
         self.last_mask = None
+        self.mask_stabilizer.reset()
         logger.info("Inference stream reset")
 
     def process_frame(self,
@@ -104,7 +124,9 @@ class InferencePipeline:
         # One segmentation pass.  The resulting mask is reused for IR (resized
         # to the IR resolution), which avoids running YOLO twice per frame.
         if rgb_available and rgb_mask is None and self.segmentation is not None:
-            rgb_mask = self.segmentation.extract_person_mask(rgb_frame)
+            rgb_mask = self.mask_stabilizer.update(
+                self.segmentation.extract_person_mask(rgb_frame)
+            )
 
         if ir_available:
             if ir_mask is None and rgb_mask is not None and rgb_available:
@@ -131,7 +153,8 @@ class InferencePipeline:
 
         if score_available:
             smoothed_score = self._smooth_score(float(raw_score))
-            is_anomalous = smoothed_score > self.threshold
+            # ">=" matches the offline metrics (sklearn threshold semantics).
+            is_anomalous = smoothed_score >= self.threshold
         else:
             # The first frame of a stream has no previous prediction.
             smoothed_score = 0.0

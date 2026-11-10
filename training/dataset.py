@@ -20,13 +20,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
 
-def _to_rgb(frame: np.ndarray) -> np.ndarray:
-    """Convert a decoded OpenCV frame to 3-channel uint8."""
+def _to_bgr(frame: np.ndarray) -> np.ndarray:
+    """Convert a decoded OpenCV frame to 3-channel BGR uint8 (OpenCV order)."""
     if frame.ndim == 2:
         return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     if frame.ndim == 3 and frame.shape[2] == 1:
@@ -175,7 +175,7 @@ class NormalVideoDataset(Dataset):
             ret_rgb, frame_rgb = cap_rgb.read()
             if not ret_rgb:
                 break
-            frame_rgb = _to_rgb(frame_rgb)
+            frame_rgb = _to_bgr(frame_rgb)
             rgb_frames.append(cv2.resize(frame_rgb, (w, h), interpolation=cv2.INTER_LINEAR))
 
             if cap_ir is not None:
@@ -229,7 +229,7 @@ class CachedFeatureDataset(Dataset):
                  sequence_stride: int = 1,
                  rgb_dropout_prob: float = 0.15,
                  ir_dropout_prob: float = 0.15,
-                 max_cached_videos: int = 4):
+                 max_cached_videos: int = 8):
         self.cache_paths = [Path(p) for p in cache_paths]
         if not self.cache_paths:
             raise ValueError("cache_paths is empty")
@@ -293,10 +293,7 @@ class CachedFeatureDataset(Dataset):
             self._cache.move_to_end(cache_idx)
             return self._cache[cache_idx]
 
-        try:
-            data = torch.load(self.cache_paths[cache_idx], map_location="cpu", weights_only=True)
-        except Exception:
-            data = torch.load(self.cache_paths[cache_idx], map_location="cpu", weights_only=False)
+        data = torch.load(self.cache_paths[cache_idx], map_location="cpu", weights_only=True)
         if "rgb_features" not in data:
             raise ValueError(f"Cache file missing rgb_features: {self.cache_paths[cache_idx]}")
         self._cache[cache_idx] = data
@@ -335,6 +332,45 @@ class CachedFeatureDataset(Dataset):
             "ir_available": ir_available,
             "sequence_id": data.get("sequence_id", self.cache_paths[cache_idx].stem),
         }
+
+
+class VideoBlockSampler(Sampler):
+    """
+    Shuffle windows without thrashing ``CachedFeatureDataset``'s video cache.
+
+    A plain ``shuffle=True`` draws windows from random videos, so with an
+    LRU of a few videos nearly every item reloads a whole ``.pt`` file from
+    disk.  This sampler shuffles the video order each epoch, takes
+    ``block_videos`` videos at a time, and shuffles all windows within that
+    block.  Batches still mix several videos, and each video is loaded about
+    once per epoch.  Keep ``block_videos <= dataset.max_cached_videos``.
+    """
+
+    def __init__(self, dataset: "CachedFeatureDataset", block_videos: Optional[int] = None, seed: int = 0):
+        self.dataset = dataset
+        self.block_videos = max(1, int(block_videos or dataset.max_cached_videos))
+        self.seed = int(seed)
+        self.epoch = 0
+        self._by_video: Dict[int, List[int]] = {}
+        for item_index, (cache_idx, _start) in enumerate(dataset.index):
+            self._by_video.setdefault(cache_idx, []).append(item_index)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return len(self.dataset.index)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        videos = list(self._by_video)
+        rng.shuffle(videos)
+        for first in range(0, len(videos), self.block_videos):
+            block = [item for video in videos[first:first + self.block_videos]
+                     for item in self._by_video[video]]
+            rng.shuffle(block)
+            yield from block
 
 
 def split_videos_by_video(video_paths: List[Path],

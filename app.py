@@ -7,9 +7,11 @@ the frame-level anomaly score, status and FPS update in real time.
 
 from __future__ import annotations
 
+import logging
+import os
 import tempfile
+import threading
 import time
-import traceback
 from collections import deque
 from pathlib import Path
 
@@ -23,7 +25,15 @@ from models.anomaly_model import VigiLensModel
 from models.segmentation import YOLOSegmentation
 from pipeline.frame_source import create_frame_source
 from pipeline.inference import InferencePipeline
-from training.calibration import AnomalyCalibrator
+from training.calibration import AnomalyCalibrator, file_sha256
+
+logger = logging.getLogger("vigilens.app")
+
+REPO_ROOT = Path(__file__).resolve().parent
+CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
+# Uploaded videos are written next to the repository (not to the system temp
+# directory) unless VIGILENS_UPLOAD_DIR says otherwise.
+UPLOAD_DIR = Path(os.environ.get("VIGILENS_UPLOAD_DIR", REPO_ROOT / ".tmp" / "uploads"))
 
 st.set_page_config(page_title="VigiLens", layout="wide")
 
@@ -64,25 +74,47 @@ def load_runtime(device: str,
     del checkpoint_mtime, calibration_mtime  # cache-key only
 
     model = VigiLensModel(device=device)
-    messages = []
-    if Path(checkpoint_path).exists():
+    messages = []  # (level, text)
+    checkpoint_ok = Path(checkpoint_path).is_file()
+    if checkpoint_ok:
         model.load_checkpoint(checkpoint_path)
-        messages.append(f"Checkpoint loaded: {checkpoint_path}")
+        messages.append(("info", f"Checkpoint loaded: {Path(checkpoint_path).name}"))
     else:
-        messages.append(f"Checkpoint not found: {checkpoint_path}. Using untrained model.")
+        messages.append(("warning", f"Checkpoint not found: {checkpoint_path}. "
+                                    "Using an UNTRAINED model; scores are meaningless."))
+    # Fusion/LSTM on the same device as the features, dropout disabled.
+    model.to(model.device)
+    model.eval()
 
     calibration_info = None
-    if Path(calibration_path).exists():
-        calibration_info = AnomalyCalibrator.load_calibration(calibration_path)
-        messages.append(
-            "Calibration loaded: threshold="
-            f"{calibration_info.get('threshold', calibration_info.get('threshold_std', 0.5)):.6f}"
-        )
+    if Path(calibration_path).is_file():
+        candidate = AnomalyCalibrator.load_calibration(calibration_path)
+        expected = candidate.get("checkpoint_sha256")
+        if not checkpoint_ok:
+            messages.append(("warning", "Calibration ignored: there is no trained checkpoint to go with it."))
+        elif expected and expected != file_sha256(checkpoint_path):
+            messages.append(("warning", "Calibration ignored: it was computed for a different "
+                                        "checkpoint. Re-run `python -m training.calibration`."))
+        else:
+            calibration_info = candidate
+            if not expected:
+                messages.append(("warning", "Calibration file does not record which checkpoint it "
+                                            "belongs to; re-run calibration to be sure it matches."))
+            messages.append(("info", f"Calibration loaded: {Path(calibration_path).name}"))
     else:
-        messages.append(f"Calibration not found: {calibration_path}. Using default threshold.")
+        messages.append(("warning", f"Calibration not found: {calibration_path}. Using default threshold."))
 
     segmentation = YOLOSegmentation(model_path=yolo_model_path, device=device)
-    return model, segmentation, calibration_info, messages
+    # One shared model instance holds per-stream state, so only one video can
+    # be analysed at a time across all browser sessions.
+    return model, segmentation, calibration_info, messages, threading.Lock()
+
+
+def _choices(directory: Path, pattern: str, default: str) -> list:
+    found = sorted(str(path.relative_to(REPO_ROOT)) for path in directory.glob(pattern)) if directory.exists() else []
+    if default not in found:
+        found.insert(0, default)
+    return found
 
 
 # ------------------ Sidebar ------------------
@@ -102,9 +134,16 @@ else:
 
 config = get_config()
 st.sidebar.subheader("Model")
-checkpoint_path = st.sidebar.text_input("Checkpoint Path", config.inference.checkpoint_path)
-calibration_path = st.sidebar.text_input("Calibration Path", config.calibration.calibration_path)
-yolo_model_path = st.sidebar.text_input("YOLO Model", config.inference.yolo_model_path)
+# Only files inside the repository's checkpoints/ directory can be selected.
+checkpoint_choice = st.sidebar.selectbox(
+    "Checkpoint", _choices(CHECKPOINT_DIR, "*.pth", config.inference.checkpoint_path)
+)
+calibration_choice = st.sidebar.selectbox(
+    "Calibration", _choices(CHECKPOINT_DIR, "*.json", config.calibration.calibration_path)
+)
+checkpoint_path = str(REPO_ROOT / checkpoint_choice)
+calibration_path = str(REPO_ROOT / calibration_choice)
+yolo_model_path = config.inference.yolo_model_path
 
 st.sidebar.subheader("Temporal Smoothing")
 smoothing_method = st.sidebar.selectbox("Smoothing Method", ["moving_average", "exponential"])
@@ -138,15 +177,17 @@ if visible_file:
     frame_source = None
     pipeline = None
 
+    run_lock = None
     try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         suffix = Path(visible_file.name).suffix or ".mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as visible_temp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as visible_temp:
             visible_temp.write(visible_file.read())
             visible_temp_path = Path(visible_temp.name)
 
         if ir_file:
             ir_suffix = Path(ir_file.name).suffix or suffix
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ir_suffix) as ir_temp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ir_suffix, dir=UPLOAD_DIR) as ir_temp:
                 ir_temp.write(ir_file.read())
                 ir_temp_path = Path(ir_temp.name)
             st.info("IR video loaded - multimodal mode")
@@ -154,7 +195,7 @@ if visible_file:
             st.warning("IR video not provided - visible-only mode")
 
         with st.spinner("Initializing models..."):
-            model, segmentation, calibration_info, messages = load_runtime(
+            model, segmentation, calibration_info, messages, lock = load_runtime(
                 device,
                 checkpoint_path,
                 calibration_path,
@@ -162,8 +203,13 @@ if visible_file:
                 _mtime(calibration_path),
                 yolo_model_path,
             )
-            for message in messages:
-                st.info(message)
+            for level, message in messages:
+                (st.warning if level == "warning" else st.info)(message)
+
+            if not lock.acquire(blocking=False):
+                st.warning("Another video is being analysed right now. Please wait for it to finish.")
+                st.stop()
+            run_lock = lock
             model.reset_stream()
 
             pipeline = InferencePipeline(
@@ -172,7 +218,15 @@ if visible_file:
                 calibration_info=calibration_info,
                 smoothing_window=window_size,
                 smoothing_method=smoothing_method,
+                ema_alpha=config.inference.ema_alpha,
+                default_threshold=config.inference.default_threshold,
+                mask_hold_frames=config.inference.mask_hold_frames,
             )
+            if pipeline.threshold_source == "default":
+                st.warning("Threshold is an uncalibrated placeholder; ANOMALY/NORMAL labels are not meaningful.")
+            elif pipeline.threshold_source == "raw" and (smoothing_method != "moving_average" or window_size > 1):
+                st.warning("Calibration only has a raw-score threshold; it does not match the selected "
+                           "smoothing. Re-run calibration.")
             frame_source = create_frame_source(
                 str(visible_temp_path), str(ir_temp_path) if ir_temp_path else None
             )
@@ -256,9 +310,12 @@ if visible_file:
         st.success(f"Processing complete - {frame_count} frames processed")
 
     except Exception as exc:
+        # Full traceback goes to the server log only.
+        logger.exception("Video analysis failed")
         st.error(f"Error: {exc}")
-        st.error(traceback.format_exc())
     finally:
+        if run_lock is not None:
+            run_lock.release()
         if frame_source is not None:
             try:
                 frame_source.release()

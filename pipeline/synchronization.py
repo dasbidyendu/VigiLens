@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class PairedFrame:
     """A synchronized visible/IR frame pair."""
 
-    visible_frame: np.ndarray
+    visible_frame: Optional[np.ndarray]
     ir_frame: Optional[np.ndarray]
     frame_index: int
     visible_timestamp: Optional[float] = None
@@ -78,7 +78,7 @@ class FrameSynchronizer:
                     visible_timestamp: Optional[float] = None,
                     ir_timestamp: Optional[float] = None) -> Optional[PairedFrame]:
         """Pair the supplied frames without dropping the visible frame."""
-        if visible_frame is None:
+        if visible_frame is None and ir_frame is None:
             return None
 
         if visible_timestamp is not None and ir_timestamp is not None:

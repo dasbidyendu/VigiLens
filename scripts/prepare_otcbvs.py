@@ -41,29 +41,39 @@ from training.utils import (
     ensure_dir,
     list_images,
     natural_key,
+    prepare_split_dirs,
     safe_stem,
 )
 
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mov", ".mkv", ".webm", ".m4v"}
-VISIBLE_WORDS = ("visible", "color", "colour", "rgb", "day")
-IR_WORDS = ("thermal", "infrared", "lwir", "ir", "night")
+# Matched as whole name *tokens*, not substrings: "ir" must not match
+# "stairs"/"first"/"dir".  Lighting words such as "day"/"night" are not
+# modalities and are kept as part of the pairing key.
+VISIBLE_WORDS = ("visible", "vis", "color", "colour", "rgb")
+IR_WORDS = ("thermal", "infrared", "lwir", "ir", "therm")
 MODALITY_WORDS = VISIBLE_WORDS + IR_WORDS
 
 
+def _tokens(name: str) -> List[str]:
+    """Split ``Seq1_IR-01`` / ``seq1Thermal`` into lowercase word/number tokens."""
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+    return [token for token in re.split(r"[^a-z0-9]+|(?<=[a-z])(?=[0-9])|(?<=[0-9])(?=[a-z])",
+                                        spaced.lower()) if token]
+
+
 def _classify(name: str) -> Optional[str]:
-    lowered = name.lower()
-    if any(word in lowered for word in IR_WORDS):
+    tokens = set(_tokens(name))
+    is_ir = bool(tokens & set(IR_WORDS))
+    is_rgb = bool(tokens & set(VISIBLE_WORDS))
+    if is_ir and not is_rgb:
         return "ir"
-    if any(word in lowered for word in VISIBLE_WORDS):
+    if is_rgb and not is_ir:
         return "rgb"
     return None
 
 
 def _pair_key(name: str) -> str:
-    lowered = name.lower()
-    for word in sorted(MODALITY_WORDS, key=len, reverse=True):
-        lowered = lowered.replace(word, "")
-    return re.sub(r"[^a-z0-9]+", "", lowered)
+    return "".join(token for token in _tokens(name) if token not in MODALITY_WORDS)
 
 
 def _is_video(path: Path) -> bool:
@@ -105,16 +115,14 @@ def discover_directory_pairs(root: Path) -> List[Tuple[Path, Path]]:
     for directory in root.rglob("*"):
         if not directory.is_dir():
             continue
-        name = directory.name.lower()
-        if not any(word in name for word in VISIBLE_WORDS):
+        if _classify(directory.name) != "rgb":
             continue
         parent = directory.parent
         candidates = []
         for sibling in parent.iterdir():
             if not sibling.is_dir() or sibling == directory:
                 continue
-            sibling_name = sibling.name.lower()
-            if any(word in sibling_name for word in IR_WORDS):
+            if _classify(sibling.name) == "ir":
                 candidates.append(sibling)
         if candidates:
             pairs.append((directory, candidates[0]))
@@ -167,6 +175,8 @@ def _write_pair_from_images(visible_dir: Path,
         str(out_ir), cv2.VideoWriter_fourcc(*"mp4v"), fps, (ir_w, ir_h), isColor=False
     )
     if not rgb_writer.isOpened() or not ir_writer.isOpened():
+        rgb_writer.release()
+        ir_writer.release()
         raise RuntimeError(f"Could not open output videos: {out_rgb} / {out_ir}")
 
     try:
@@ -218,6 +228,8 @@ def _write_pair_from_videos(rgb_path: Path,
     if not rgb_writer.isOpened() or not ir_writer.isOpened():
         rgb_cap.release()
         ir_cap.release()
+        rgb_writer.release()
+        ir_writer.release()
         raise RuntimeError(f"Could not open output videos: {out_rgb} / {out_ir}")
 
     count = 0
@@ -271,6 +283,8 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--manifest", default=None, help="Optional pairs.json output")
+    parser.add_argument("--clean", action="store_true",
+                        help="Delete existing <output>/train and <output>/val folders first")
     args = parser.parse_args()
 
     root = Path(args.input)
@@ -291,6 +305,7 @@ def main() -> None:
 
     train_pairs, val_pairs = (pairs, []) if args.all_train else split_pairs(pairs, args.val_ratio, args.seed)
     output = Path(args.output)
+    prepare_split_dirs(output, ("train", "val"), args.clean)
     records = []
 
     for split, split_pairs_list in (("train", train_pairs), ("val", val_pairs)):

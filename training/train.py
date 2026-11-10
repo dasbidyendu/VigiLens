@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 from config.config import get_config
 from models.anomaly_model import VigiLensModel
-from training.dataset import CachedFeatureDataset, NormalVideoDataset
+from training.dataset import CachedFeatureDataset, NormalVideoDataset, VideoBlockSampler
 from training.scoring import fuse_sequence
 from training.utils import (
     DEFAULT_VIDEO_EXTENSIONS,
@@ -66,6 +66,28 @@ def _autocast(device: str, enabled: bool):
         dtype=torch.float16,
         enabled=bool(enabled and str(device).startswith("cuda") and torch.cuda.is_available()),
     )
+
+
+def _param_groups(parameters, weight_decay: float) -> List[Dict]:
+    """
+    Split parameters so biases and LayerNorm/BatchNorm affine weights get no
+    weight decay.  Decaying the final LayerNorm gain would shrink every fused
+    feature towards a constant, which makes next-feature prediction trivially
+    easy and the anomaly score meaningless.
+    """
+    decay, no_decay = [], []
+    seen = set()
+    for param in parameters:
+        if not param.requires_grad or id(param) in seen:
+            continue
+        seen.add(id(param))
+        (no_decay if param.ndim <= 1 else decay).append(param)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
 
 
 def _move_batch(batch: Dict, device: str) -> Dict:
@@ -112,7 +134,10 @@ def train_epoch_cached(model,
                 model, rgb_sequence, ir_sequence, rgb_available, ir_available
             )
             predictions, _ = model.temporal.forward_sequence(fused[:, :-1])
-            targets = fused[:, 1:]
+            # Stop-gradient on the target: fusion is trained only through the
+            # predictor's input.  Without this, fusion and predictor can
+            # jointly collapse to a constant embedding with ~zero loss.
+            targets = fused[:, 1:].detach()
             loss = F.smooth_l1_loss(predictions, targets)
 
         if not torch.isfinite(loss):
@@ -164,7 +189,8 @@ def train_cached(model,
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        # Video-blocked shuffling keeps the per-video feature cache effective.
+        sampler=VideoBlockSampler(train_dataset, seed=seed),
         num_workers=num_workers,
         pin_memory=str(device).startswith("cuda"),
         drop_last=False,
@@ -179,7 +205,7 @@ def train_cached(model,
     )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(_param_groups(trainable, weight_decay), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
     )
@@ -189,34 +215,63 @@ def train_cached(model,
     best_val_loss = float("inf")
     history: List[Dict] = []
 
-    if resume is not None and Path(resume).exists():
+    if resume is not None:
+        if not Path(resume).exists():
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume}")
         logger.info("Resuming from %s", resume)
-        try:
-            checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
-        except Exception:
-            checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
         state = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state)
+        extra = checkpoint.get("extra", {}) or {}
         if "optimizer_state_dict" in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except (ValueError, KeyError) as exc:
                 logger.warning("Could not restore optimizer state: %s", exc)
-        if "scheduler_state_dict" in checkpoint:
+        # The scheduler/scaler states are stored inside ``extra``.
+        scheduler_state = extra.get("scheduler_state_dict") or checkpoint.get("scheduler_state_dict")
+        if scheduler_state:
             try:
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            except (ValueError, KeyError) as exc:
+                scheduler.load_state_dict(scheduler_state)
+            except (ValueError, KeyError, TypeError) as exc:
                 logger.warning("Could not restore scheduler state: %s", exc)
+        scaler_state = extra.get("scaler_state_dict")
+        if scaler_state and scaler.is_enabled():
+            try:
+                scaler.load_state_dict(scaler_state)
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning("Could not restore GradScaler state: %s", exc)
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
-        best_val_loss = float(checkpoint.get("loss", float("inf")))
-        extra = checkpoint.get("extra", {}) or {}
         history = list(extra.get("history", []))
+        # The best loss so far is the minimum over the whole history, not the
+        # loss of the checkpoint being resumed (which may be last_model.pth).
+        finite = [float(e["val_loss"]) for e in history
+                  if e.get("val_loss") is not None and math.isfinite(float(e["val_loss"]))]
+        if finite:
+            best_val_loss = min(finite)
+        elif best_path.exists():
+            best_val_loss = float(
+                torch.load(best_path, map_location="cpu", weights_only=True).get("loss", float("inf"))
+            )
 
     logger.info(
         "Cached training: %d train sequences, %d val sequences, %d epochs, batch=%d",
         len(train_dataset), len(val_dataset), epochs, batch_size,
     )
     logger.info("Trainable parameters: %d", sum(p.numel() for p in trainable))
+
+    # Reference spread of the fused features before (further) training.  A
+    # collapse shows up as this spread shrinking towards zero; the absolute
+    # value depends on how varied the videos are, so only the ratio is used.
+    baseline_std = float("nan")
+    if start_epoch <= epochs:
+        baseline = validate_cached(
+            model, [Path(path) for path in val_dataset.cache_paths], device=device,
+            sequence_length=val_dataset.sequence_length,
+            batch_size=val_batch_size or batch_size, num_workers=num_workers, amp=amp,
+            limit_batches=limit_batches,
+        )
+        baseline_std = float(baseline.get("fused_std", float("nan")))
 
     for epoch in range(start_epoch, epochs + 1):
         train_loss = train_epoch_cached(
@@ -239,17 +294,27 @@ def train_cached(model,
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "val_mse": float(val_result.get("mean_error", float("nan"))),
+            "fused_std": float(val_result.get("fused_std", float("nan"))),
             "lr": optimizer.param_groups[0]["lr"],
         }
         history.append(entry)
         logger.info(
-            "Epoch %d/%d: train=%.6f val=%.6f lr=%.2e",
-            epoch, epochs, train_loss, val_loss, entry["lr"],
+            "Epoch %d/%d: train=%.6f val=%.6f fused_std=%.4f lr=%.2e",
+            epoch, epochs, train_loss, val_loss, entry["fused_std"], entry["lr"],
         )
+        if (math.isfinite(entry["fused_std"]) and math.isfinite(baseline_std) and baseline_std > 0
+                and entry["fused_std"] < 0.1 * baseline_std):
+            logger.warning(
+                "Fused features are collapsing: their spread fell from %.4f to %.4f. "
+                "The anomaly score will not be informative; lower the learning rate "
+                "or check the training data.", baseline_std, entry["fused_std"],
+            )
 
         extra = {
             "history": history,
             "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler.is_enabled() else None,
             "num_train_sequences": len(train_dataset),
             "num_val_sequences": len(val_dataset),
         }
@@ -347,10 +412,12 @@ def _online_epoch(model,
     model.train(training)
     model.fusion.train(training)
     model.temporal.train(training)
+    # ResNet50 has no dropout, so train/eval only affects BatchNorm, whose
+    # statistics the extractor keeps frozen either way.
     if hasattr(model.rgb_extractor, "train"):
-        model.rgb_extractor.train(training and any(p.requires_grad for p in model.rgb_extractor.extractor.parameters()))
+        model.rgb_extractor.train(training)
     if hasattr(model.ir_extractor, "train"):
-        model.ir_extractor.train(training and any(p.requires_grad for p in model.ir_extractor.extractor.parameters()))
+        model.ir_extractor.train(training)
     if segmentation is not None:
         segmentation.model.eval()
 
@@ -375,32 +442,33 @@ def _online_epoch(model,
 
         with context:
             with _autocast(device, amp):
+                use_ir = ir_sequence is not None and bool(ir_available.any())
+                # Encode every frame once (one YOLO + ResNet pass per frame);
+                # the old loop ran both twice, once as "current" and once as
+                # "next".
+                fused_frames = []
+                for t in range(sequence_length):
+                    rgb_t = rgb_sequence[:, t]
+                    masks = (segmentation.extract_person_masks(_to_bgr_uint8(rgb_t))
+                             if segmentation is not None else None)
+                    rgb_features = _online_features(model.rgb_extractor, rgb_t, masks)
+                    ir_features = None
+                    if use_ir:
+                        ir_t = ir_sequence[:, t]
+                        ir_features = _online_ir_features(
+                            model.ir_extractor, ir_t, _ir_masks_from_rgb(masks, ir_t)
+                        )
+                    fused_frames.append(
+                        model.fusion(rgb_features, ir_features, rgb_available, ir_available)
+                    )
+
                 batch_loss = torch.zeros((), device=device)
                 steps = 0
                 for t in range(sequence_length - 1):
-                    rgb_current = rgb_sequence[:, t]
-                    rgb_next = rgb_sequence[:, t + 1]
-                    ir_current = ir_sequence[:, t] if ir_sequence is not None else None
-                    ir_next = ir_sequence[:, t + 1] if ir_sequence is not None else None
-
-                    rgb_masks = segmentation.extract_person_masks(_to_bgr_uint8(rgb_current)) if segmentation is not None else None
-                    rgb_next_masks = segmentation.extract_person_masks(_to_bgr_uint8(rgb_next)) if segmentation is not None else None
-
-                    rgb_features = _online_features(model.rgb_extractor, rgb_current, rgb_masks)
-                    rgb_next_features = _online_features(model.rgb_extractor, rgb_next, rgb_next_masks)
-
-                    ir_features = None
-                    ir_next_features = None
-                    if ir_current is not None and bool(ir_available.any()):
-                        ir_masks = _ir_masks_from_rgb(rgb_masks, ir_current)
-                        ir_features = _online_ir_features(model.ir_extractor, ir_current, ir_masks)
-                    if ir_next is not None and bool(ir_available.any()):
-                        ir_next_masks = _ir_masks_from_rgb(rgb_next_masks, ir_next)
-                        ir_next_features = _online_ir_features(model.ir_extractor, ir_next, ir_next_masks)
-
-                    fused = model.fusion(rgb_features, ir_features, rgb_available, ir_available)
-                    fused_next = model.fusion(rgb_next_features, ir_next_features, rgb_available, ir_available)
-                    loss, hidden_state = model.training_step(fused, fused_next, hidden_state)
+                    # Stop-gradient target (see train_epoch_cached).
+                    loss, hidden_state = model.training_step(
+                        fused_frames[t], fused_frames[t + 1].detach(), hidden_state
+                    )
                     batch_loss = batch_loss + loss
                     steps += 1
 
@@ -458,7 +526,7 @@ def train_online(model,
     if unfreeze_layer4:
         trainable += model.rgb_extractor.extractor.trainable_parameters()
         trainable += model.ir_extractor.extractor.trainable_parameters()
-    optimizer = torch.optim.AdamW(trainable, lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(_param_groups(trainable, weight_decay), lr=learning_rate)
     scaler = torch.amp.GradScaler("cuda", enabled=bool(amp and str(device).startswith("cuda")))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
@@ -477,12 +545,12 @@ def train_online(model,
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
         logger.info("Epoch %d/%d: train=%.6f val=%.6f", epoch, epochs, train_loss, val_loss)
         model.save_checkpoint(
-            str(best_path if val_loss < best_val else checkpoint_dir / "last_model.pth"),
+            str(checkpoint_dir / "last_model.pth"),
             epoch, val_loss, config_dict or {},
             optimizer_state=optimizer.state_dict(), extra={"history": history},
             include_encoders=unfreeze_layer4,
         )
-        if val_loss < best_val:
+        if math.isfinite(val_loss) and val_loss < best_val:
             best_val = val_loss
             model.save_checkpoint(
                 str(best_path), epoch, val_loss, config_dict or {},
@@ -503,6 +571,19 @@ def discover_caches(cache_dir: Union[str, Path]) -> List[Path]:
     return sorted(path for path in directory.rglob("*.pt") if path.is_file())
 
 
+def _split_holdout(paths: List[Path], fraction: float, seed: int) -> Tuple[List[Path], List[Path]]:
+    """Hold out whole videos (never windows of the same video) for validation."""
+    paths = sorted(paths)
+    if len(paths) < 2:
+        return paths, []
+    count = max(1, int(round(len(paths) * fraction)))
+    count = min(count, len(paths) - 1)
+    shuffled = list(paths)
+    random.Random(seed).shuffle(shuffled)
+    held_out = set(shuffled[:count])
+    return [p for p in paths if p not in held_out], [p for p in paths if p in held_out]
+
+
 def build_cached_datasets(cache_dir: Union[str, Path],
                           train_cache: Optional[Union[str, Path]] = None,
                           val_cache: Optional[Union[str, Path]] = None,
@@ -510,21 +591,54 @@ def build_cached_datasets(cache_dir: Union[str, Path],
                           sequence_stride: int = 1,
                           rgb_dropout_prob: float = 0.15,
                           ir_dropout_prob: float = 0.15,
-                          max_cached_videos: int = 4) -> Tuple[CachedFeatureDataset, CachedFeatureDataset]:
-    cache_dir = Path(cache_dir)
-    train_dir = Path(train_cache) if train_cache else (cache_dir / "train" if (cache_dir / "train").exists() else cache_dir)
-    val_dir = Path(val_cache) if val_cache else (cache_dir / "val" if (cache_dir / "val").exists() else cache_dir)
+                          max_cached_videos: int = 8,
+                          val_fraction: float = 0.1,
+                          seed: int = 42) -> Tuple[CachedFeatureDataset, CachedFeatureDataset]:
+    """
+    Build train/val datasets from ``cache_dir/train`` and ``cache_dir/val``.
 
-    train_paths = discover_caches(train_dir)
+    Without a ``train/`` sub-directory only the ``.pt`` files directly inside
+    ``cache_dir`` are used, so ``cache/test`` or ``cache/eval`` (which may
+    contain anomalous clips) can never leak into training.  Without a
+    ``val/`` sub-directory a fraction of the training *videos* is held out;
+    validation never reuses training videos.
+    """
+    cache_dir = Path(cache_dir)
+    if train_cache:
+        train_dir = Path(train_cache)
+        train_paths = discover_caches(train_dir)
+    elif (cache_dir / "train").exists():
+        train_dir = cache_dir / "train"
+        train_paths = discover_caches(train_dir)
+    else:
+        train_dir = cache_dir
+        train_paths = sorted(p for p in cache_dir.glob("*.pt") if p.is_file()) if cache_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError(
             f"No .pt feature caches found in {train_dir}. Run "
             "`python -m training.precompute --data-dir Data --output cache` first."
         )
-    val_paths = discover_caches(val_dir)
+
+    if val_cache:
+        val_paths = discover_caches(val_cache)
+    elif (cache_dir / "val").exists():
+        val_paths = discover_caches(cache_dir / "val")
+    else:
+        val_paths = []
+    overlap = {p.resolve() for p in val_paths} & {p.resolve() for p in train_paths}
+    if overlap:
+        raise ValueError(f"Validation caches overlap the training caches: {sorted(overlap)[:3]}")
     if not val_paths:
-        logger.warning("No validation caches found; using training caches for validation")
-        val_paths = train_paths
+        train_paths, val_paths = _split_holdout(train_paths, val_fraction, seed)
+        if not val_paths:
+            raise ValueError(
+                "No validation caches found and only one training video exists; "
+                "add a cache/val directory or more videos."
+            )
+        logger.warning(
+            "No validation caches found; holding out %d of %d training videos for validation",
+            len(val_paths), len(val_paths) + len(train_paths),
+        )
 
     train_dataset = CachedFeatureDataset(
         train_paths, sequence_length=sequence_length, sequence_stride=sequence_stride,
@@ -715,6 +829,7 @@ def main() -> None:
             sequence_length=args.seq_len, sequence_stride=args.seq_stride,
             rgb_dropout_prob=config.training.rgb_dropout_prob,
             ir_dropout_prob=config.training.ir_dropout_prob,
+            seed=args.seed,
         )
         result = train_cached(
             model, train_dataset, val_dataset, args.device,
@@ -729,15 +844,22 @@ def main() -> None:
     print(json.dumps(result, indent=2))
 
     if args.calibrate and not args.online:
-        from training.calibration import AnomalyCalibrator
+        from training.calibration import calibrate_from_caches
 
-        caches = discover_caches(args.val_cache or (Path(args.cache_dir) / "val"))
-        if caches:
-            calibrator = AnomalyCalibrator(model)
-            errors = calibrator.collect_errors_from_caches(caches, device=args.device)
-            info = calibrator.compute_threshold(errors)
-            calibrator.save_calibration(info, Path(args.checkpoint_dir) / "calibration.json")
-            print(json.dumps(info, indent=2))
+        best_checkpoint = Path(result["best_checkpoint"])
+        caches = [Path(p) for p in val_dataset.cache_paths]
+        if caches and best_checkpoint.exists():
+            # Calibrate the checkpoint the app will load (best, not last epoch).
+            model.load_checkpoint(str(best_checkpoint))
+            model.to(args.device)
+            info = calibrate_from_caches(
+                model, caches, device=args.device,
+                output_path=Path(args.checkpoint_dir) / "calibration.json",
+                checkpoint_path=best_checkpoint,
+                k_std=config.calibration.k_std,
+                percentile=config.calibration.percentile,
+            )
+            print(json.dumps({k: v for k, v in info.items() if k != "thresholds"}, indent=2))
 
 
 if __name__ == "__main__":

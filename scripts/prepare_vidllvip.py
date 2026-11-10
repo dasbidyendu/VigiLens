@@ -36,7 +36,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_REPO_ROOT))
 
-from training.utils import ensure_dir, safe_stem
+from training.utils import ensure_dir, prepare_split_dirs, safe_stem
 
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
@@ -99,41 +99,40 @@ def discover_vidllvip_pairs(root: Path) -> List[Tuple[Path, Path]]:
     return pairs
 
 
-def extract_source_id(filename: str) -> Optional[str]:
+def extract_source_id(filename: str, pattern: Optional[str] = None) -> Optional[str]:
     """
-    Attempt to extract source video ID from VidLLVIP filename.
-    
-    VidLLVIP clips are derived from a smaller set of source videos.
-    We need to identify clips from the same source to prevent data leakage.
-    
-    VidLLVIP naming convention varies; this is a best-effort heuristic.
-    Common patterns:
-    - clip_001_0001.mp4 -> source: clip_001
-    - scene01_clip01.mp4 -> source: scene01
-    - 001_0001.mp4 -> source: 001
+    Best-effort source-video ID for a VidLLVIP clip filename.
+
+    Clips cut from the same source video must stay in the same split, or
+    validation/test frames leak into training.  The naming convention is not
+    documented, so this is a heuristic; pass ``pattern`` (``--source-regex``),
+    a regex whose first group is the source ID, when you know the convention.
+
+    Default rules (first match wins):
+    - ``clip_001_0001`` -> ``clip_001`` (drop the trailing ``_<number>``)
+    - ``scene01_0003``  -> ``scene01``
+    - ``001_0001``      -> ``001``
+    - anything else (e.g. ``scene01_clip01``) -> the whole stem, i.e. the clip
+      is its own source.
+
+    Note that ``clip_001`` / ``clip_002`` both map to ``clip``: treating them as
+    one source is the leak-safe choice, but if *every* clip maps to a handful
+    of IDs the split degenerates; ``split_by_source`` reports that.
     """
-    # Remove extension
     name = Path(filename).stem
-    
-    # Try pattern: prefix_number_number (extract prefix_number)
-    # This handles cases like clip_001_0001 -> clip_001
+    if pattern:
+        match = re.match(pattern, name)
+        if match:
+            return match.group(1)
+        return name
+
     match = re.match(r'^(.+_\d+)_(\d+)$', name)
     if match:
         return match.group(1)
-    
-    # Try pattern: prefix_number (extract prefix)
-    # This handles cases like scene01_clip01 -> scene01
+    # Also covers "001_0001" -> "001".
     match = re.match(r'^(.+)_\d+$', name)
     if match:
         return match.group(1)
-    
-    # Pattern: number_number (extract first number)
-    match = re.match(r'^(\d+)_(\d+)$', name)
-    if match:
-        return match.group(1)
-    
-    # If no pattern matches, use the full filename as source ID
-    # This means each clip is treated as independent (no leakage prevention)
     return name
 
 
@@ -169,19 +168,28 @@ def validate_video_pair(rgb_path: Path, ir_path: Path) -> Dict:
     }
 
 
+# Set by split_by_source so the manifest records what actually happened.
+LAST_SPLIT_METHOD = "source_level"
+
+
 def split_by_source(pairs: Sequence[Tuple[Path, Path]],
                    val_ratio: float,
                    test_ratio: float,
-                   seed: int) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
+                   seed: int,
+                   source_pattern: Optional[str] = None,
+                   allow_clip_split: bool = True) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
     """
     Split pairs by source video ID to prevent data leakage.
-    
+
     Clips from the same source video must not appear in different splits.
+    If there are too few sources, falls back to a clip-level split (which can
+    leak) only when ``allow_clip_split`` is true.
     """
+    global LAST_SPLIT_METHOD
     # Group pairs by source ID
     source_to_pairs: Dict[str, List[Tuple[Path, Path]]] = {}
     for rgb_path, ir_path in pairs:
-        source_id = extract_source_id(rgb_path.name)
+        source_id = extract_source_id(rgb_path.name, source_pattern)
         if source_id not in source_to_pairs:
             source_to_pairs[source_id] = []
         source_to_pairs[source_id].append((rgb_path, ir_path))
@@ -202,9 +210,17 @@ def split_by_source(pairs: Sequence[Tuple[Path, Path]],
         print(f"Warning: Too few sources ({n_sources}) for train/val/test split.")
         print(f"  Requested: test={test_ratio}, val={val_ratio}")
         print(f"  Result: train={n_train}, val={n_val}, test={n_test}")
+        print(f"  Example source IDs: {sorted(source_ids)[:5]}")
+        if not allow_clip_split:
+            raise SystemExit(
+                "Refusing a clip-level split (clips of one source video would leak "
+                "across splits). Pass --source-regex to describe the filename "
+                "convention, or --allow-clip-split to accept the leakage."
+            )
         print(f"  Falling back to clip-level splitting (may cause data leakage)")
-        # Fall back to clip-level split
+        LAST_SPLIT_METHOD = "clip_level"
         return split_by_clip(pairs, val_ratio, test_ratio, seed)
+    LAST_SPLIT_METHOD = "source_level"
     
     # Split sources
     test_sources = source_ids[:n_test]
@@ -329,6 +345,12 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None, help="Max frames per clip")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--manifest", default=None, help="Optional manifest output path")
+    parser.add_argument("--source-regex", default=None,
+                        help="Regex whose first group is the source-video ID of a clip stem")
+    parser.add_argument("--allow-clip-split", action="store_true",
+                        help="Allow a leaky clip-level split when there are too few sources")
+    parser.add_argument("--clean", action="store_true",
+                        help="Delete existing <output>/train|val|test folders first")
     args = parser.parse_args()
     
     root = Path(args.input)
@@ -349,15 +371,19 @@ def main() -> None:
     # Split data
     if args.all_train:
         train_pairs, val_pairs, test_pairs = pairs, [], []
+        split_method = "all_train"
         print("All pairs assigned to training (--all-train)")
     else:
         train_pairs, val_pairs, test_pairs = split_by_source(
-            pairs, args.val_ratio, args.test_ratio, args.seed
+            pairs, args.val_ratio, args.test_ratio, args.seed,
+            source_pattern=args.source_regex, allow_clip_split=args.allow_clip_split,
         )
-    
+        split_method = LAST_SPLIT_METHOD
+
     output = Path(args.output)
+    prepare_split_dirs(output, ("train", "val", "test"), args.clean)
     records = []
-    
+
     for split, split_pairs in [("train", train_pairs), ("val", val_pairs), ("test", test_pairs)]:
         if not split_pairs:
             print(f"Skipping {split} (no pairs)")
@@ -376,7 +402,7 @@ def main() -> None:
                 print(f"Skipping {sequence_id}: {exc}")
                 continue
             
-            source_id = extract_source_id(rgb_path.name)
+            source_id = extract_source_id(rgb_path.name, args.source_regex)
             records.append({
                 "sequence_id": sequence_id,
                 "source_id": source_id,
@@ -399,7 +425,8 @@ def main() -> None:
             "val_ratio": args.val_ratio,
             "test_ratio": args.test_ratio,
             "seed": args.seed,
-            "split_method": "source_level",
+            "split_method": split_method,
+            "source_regex": args.source_regex,
             "pairs": records,
         }, handle, indent=2)
     

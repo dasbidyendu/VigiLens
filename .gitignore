@@ -18,6 +18,9 @@ htmlcov/
 .tox/
 .hypothesis/
 
+# Local scratch (uploads, pytest temp, patch scripts) and tool caches
+.tmp/
+
 # Virtual environments
 .venv/
 venv/
@@ -115,7 +118,9 @@ tmp/
 temp/
 *.gif
 
-# Model weights and checkpoints
+# Model weights and checkpoints (and the per-run files that belong to them)
+checkpoints/calibration.json
+checkpoints/training_history.json
 *.pt
 *.pth
 *.onnx
@@ -178,6 +183,5 @@ docker-compose.override.yml
 training.npy
 *.mat
 *.csv
-!checkpoints/calibration.json
 !requirements.txt
 !package.json

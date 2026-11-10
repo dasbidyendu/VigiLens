@@ -72,6 +72,7 @@ def validate_cached(model,
     total_loss = 0.0
     num_batches = 0
     all_errors: List[np.ndarray] = []
+    std_sum = 0.0
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(tqdm(loader, desc="Validating", leave=False)):
@@ -93,6 +94,9 @@ def validate_cached(model,
 
             total_loss += float(loss.item())
             num_batches += 1
+            # Average per-dimension spread of the fused features; a value near
+            # zero means the representation has collapsed to a constant.
+            std_sum += float(fused.float().reshape(-1, fused.shape[-1]).std(dim=0).mean().item())
 
             errors = F.mse_loss(predictions, targets, reduction="none").mean(dim=-1)
             all_errors.append(errors.detach().cpu().numpy().reshape(-1))
@@ -103,6 +107,8 @@ def validate_cached(model,
         "errors": errors.astype(np.float32),
         "num_frames": int(errors.size),
         "num_batches": num_batches,
+        "mean_error": float(errors.mean()) if errors.size else float("nan"),
+        "fused_std": std_sum / num_batches if num_batches else float("nan"),
         "smoothing_window": smoothing_window,
     }
 

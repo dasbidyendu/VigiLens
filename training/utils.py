@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -112,6 +113,32 @@ def ensure_dir(path: Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def prepare_split_dirs(output: Path, splits: Sequence[str], clean: bool) -> None:
+    """
+    Refuse to write into split folders that already hold videos.
+
+    Re-running a preparation script with another seed or ratio used to leave
+    the previous run's clips in place, so one clip could end up in both
+    ``train/`` and ``val/``.  With ``clean=True`` the split folders (only
+    ``output/<split>``, nothing else) are removed first.
+    """
+    output = Path(output)
+    stale = [output / split for split in splits
+             if (output / split).exists() and any((output / split).rglob("*.mp4"))]
+    if not stale:
+        return
+    if not clean:
+        raise SystemExit(
+            "Output split folders already contain videos: "
+            + ", ".join(str(path) for path in stale)
+            + ". Re-run with --clean to replace them (only these folders are deleted), "
+            "or choose another --output."
+        )
+    for path in stale:
+        shutil.rmtree(path)
+        logger.info("Removed stale split folder %s", path)
 
 
 def safe_stem(value: str) -> str:

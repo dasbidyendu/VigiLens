@@ -41,12 +41,13 @@ def test_evaluate_manifest_writes_scores_and_results(tiny_model, make_cache, tmp
         device="cpu",
     )
 
+    # Frame 0 of each video has no prediction and is excluded from metrics.
     assert result["num_videos"] == 2
-    assert result["num_frames"] == 16
+    assert result["num_frames"] == 14
     assert result["threshold"] == 0.5
-    assert result["metrics"]["num_normal"] == 12
+    assert result["metrics"]["num_normal"] == 10
     assert result["metrics"]["num_anomaly"] == 4
-    assert result["metrics"]["num_frames"] == 16
+    assert result["metrics"]["num_frames"] == 14
     assert result["score_type"] == "raw"
     assert len(result["per_video"]) == 2
     assert result["per_video"][1]["label"] == 1
@@ -61,12 +62,14 @@ def test_evaluate_manifest_writes_scores_and_results(tiny_model, make_cache, tmp
     with open(scores_path, "r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 16
-    assert set(rows[0]) == {"sequence_id", "frame_index", "raw_score", "smoothed_score", "label"}
+    assert set(rows[0]) == {"sequence_id", "frame_index", "video_frame", "scored",
+                            "raw_score", "smoothed_score", "label"}
     assert sum(int(row["label"]) for row in rows) == 4
+    assert sum(int(row["scored"]) for row in rows) == 14
 
     with open(results_path, "r", encoding="utf-8") as handle:
         saved = json.load(handle)
-    assert saved["num_frames"] == 16
+    assert saved["num_frames"] == 14
 
 
 def test_evaluate_manifest_uses_calibration_threshold(tiny_model, make_cache, tmp_path):
@@ -121,4 +124,24 @@ def test_evaluate_manifest_frame_labels_file(tiny_model, make_cache, tmp_path):
         tiny_model, manifest, output_dir=tmp_path / "results", device="cpu"
     )
     assert result["metrics"]["num_anomaly"] == 2
-    assert result["metrics"]["num_normal"] == 3
+    assert result["metrics"]["num_normal"] == 2  # frame 0 is unscored
+
+
+def test_segments_follow_frame_stride(tmp_path):
+    from training.evaluate import labels_for_entry
+
+    # Cached frames are video frames 0, 2, 4, ..., 14 (frame_stride=2).
+    labels = labels_for_entry(
+        {"segments": [[4, 9]]}, 8, tmp_path, cache_labels=None,
+        frame_indices=list(range(0, 16, 2)),
+    )
+    assert labels.tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
+
+
+def test_anomaly_label_without_segments_marks_every_frame(tmp_path):
+    from training.evaluate import labels_for_entry
+
+    # make_eval_manifest --anomaly-all used to write "segments": [], which
+    # labelled whole anomaly videos as normal.
+    for entry in ({"label": "anomaly"}, {"label": "anomaly", "segments": []}):
+        assert labels_for_entry(entry, 4, tmp_path).tolist() == [1, 1, 1, 1]

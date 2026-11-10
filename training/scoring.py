@@ -12,6 +12,21 @@ For frame ``t`` the temporal model predicts the fused feature of frame
 error between that prediction and the actual fused feature at ``t + 1``.
 Frame 0 therefore has no score and is assigned ``0.0``.  This is exactly the
 one-frame latency used by the streaming inference pipeline.
+
+Context window
+--------------
+Training sees windows of ``sequence_length`` frames that each start from a
+zero LSTM state.  Scoring therefore predicts frame ``t`` from at most the
+previous ``model.context_length`` (= ``sequence_length - 1``) frames, again
+from a zero state, instead of carrying the LSTM state through a whole video
+(a horizon the model never saw during training).  The streaming pipeline in
+``VigiLensModel.process_frame`` uses the same rule, so offline scores equal
+the scores the app computes.
+
+Smoothing
+---------
+Smoothing is applied to frames ``1..N-1`` only (frame 0 has no score), which
+is what the streaming pipeline does.
 """
 
 from __future__ import annotations
@@ -29,12 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_cache(cache_path: Union[str, Path], map_location: str = "cpu") -> Dict[str, Any]:
-    """Load a feature-cache file with a safe fallback for old checkpoints."""
-    path = Path(cache_path)
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except Exception:
-        return torch.load(path, map_location=map_location, weights_only=False)
+    """Load a feature-cache file (tensors and plain Python values only)."""
+    return torch.load(Path(cache_path), map_location=map_location, weights_only=True)
 
 
 def metadata_path(cache_path: Union[str, Path]) -> Path:
@@ -160,17 +171,114 @@ def causal_moving_average(scores: np.ndarray, window: int) -> np.ndarray:
     if window == 1 or scores.size == 0:
         return scores.astype(np.float32)
     cumulative = np.concatenate(([0.0], np.cumsum(scores)))
-    result = np.empty_like(scores)
-    for index in range(scores.size):
-        start = max(0, index + 1 - window)
-        result[index] = (cumulative[index + 1] - cumulative[start]) / (index + 1 - start)
+    index = np.arange(scores.size)
+    start = np.maximum(0, index + 1 - window)
+    result = (cumulative[index + 1] - cumulative[start]) / (index + 1 - start)
     return result.astype(np.float32)
+
+
+def causal_ema(scores: np.ndarray, alpha: float) -> np.ndarray:
+    """Exponential moving average seeded with the first score (as in the app)."""
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    result = np.empty_like(scores)
+    state = None
+    for index, value in enumerate(scores):
+        state = value if state is None else alpha * value + (1.0 - alpha) * state
+        result[index] = state
+    return result.astype(np.float32)
+
+
+def smooth_scores(raw: np.ndarray,
+                  method: str = "moving_average",
+                  window: int = 1,
+                  alpha: float = 0.3) -> np.ndarray:
+    """
+    Smooth a per-video raw score array exactly like ``InferencePipeline``.
+
+    ``raw[0]`` is the placeholder for the unscored first frame: it is left at
+    0 and excluded from the smoothing history.
+    """
+    raw = np.asarray(raw, dtype=np.float32).reshape(-1)
+    smoothed = np.zeros_like(raw)
+    if raw.size <= 1:
+        return smoothed
+    if method == "exponential":
+        smoothed[1:] = causal_ema(raw[1:], alpha)
+    elif method == "moving_average":
+        smoothed[1:] = causal_moving_average(raw[1:], window)
+    else:
+        smoothed[1:] = raw[1:]
+    return smoothed
+
+
+def _context_length(model, context_length: Optional[int]) -> Optional[int]:
+    if context_length is not None:
+        return int(context_length) or None
+    value = getattr(model, "context_length", None)
+    return int(value) if value else None
+
+
+def _score_windowed(model, fused: torch.Tensor, window: int, chunk_size: int) -> np.ndarray:
+    """Predict frame t from frames [t-window, t) with a zero initial state."""
+    total = fused.shape[0]
+    raw = np.zeros(total, dtype=np.float32)
+    if total < 2:
+        return raw
+
+    # Head: frames 1..min(window, total-1).  A single zero-state pass over the
+    # first ``window`` frames gives every shorter context in one go.
+    head_len = min(window, total)
+    head_predictions, _ = model.temporal.forward_sequence(fused[:head_len].unsqueeze(0))
+    head_predictions = head_predictions.squeeze(0)
+    head_targets = min(head_len, total - 1)
+    errors = F.mse_loss(
+        head_predictions[:head_targets].float(), fused[1:head_targets + 1].float(), reduction="none"
+    ).mean(dim=1)
+    raw[1:head_targets + 1] = errors.detach().cpu().numpy()
+
+    # Tail: frames window+1..total-1, each from a full window of context.
+    offsets = torch.arange(window, device=fused.device)
+    batch = max(1, int(chunk_size))
+    for first in range(window + 1, total, batch):
+        targets_idx = torch.arange(first, min(first + batch, total), device=fused.device)
+        windows = fused[(targets_idx - window).unsqueeze(1) + offsets]  # (M, W, D)
+        predictions, _ = model.temporal.forward_sequence(windows)
+        errors = F.mse_loss(
+            predictions[:, -1].float(), fused[targets_idx].float(), reduction="none"
+        ).mean(dim=1)
+        raw[targets_idx.cpu().numpy()] = errors.detach().cpu().numpy()
+    return raw
+
+
+def _score_stateful(model, fused: torch.Tensor, chunk_size: int) -> np.ndarray:
+    """Legacy scoring: one LSTM state carried through the whole video."""
+    total = fused.shape[0]
+    raw = np.zeros(total, dtype=np.float32)
+    state = None
+    previous_prediction = None
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk = fused[start:end].unsqueeze(0)  # (1, C, D)
+        predictions, state = model.temporal.forward_sequence(chunk, state)
+        predictions = predictions.squeeze(0)  # (C, D)
+        if end - start > 1:
+            errors = F.mse_loss(predictions[:-1], fused[start + 1:end], reduction="none").mean(dim=1)
+            raw[start + 1:end] = errors.detach().cpu().numpy()
+        if previous_prediction is not None:
+            raw[start] = F.mse_loss(
+                previous_prediction, fused[start], reduction="none"
+            ).mean().item()
+        previous_prediction = predictions[-1].detach()
+    return raw
 
 
 def score_fused_sequence(model,
                          fused: torch.Tensor,
                          smoothing_window: int = 1,
-                         chunk_size: int = 256) -> Tuple[np.ndarray, np.ndarray]:
+                         chunk_size: int = 256,
+                         context_length: Optional[int] = None,
+                         smoothing_method: str = "moving_average",
+                         ema_alpha: float = 0.3) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute per-frame prediction errors and their causal smoothed version.
 
@@ -178,7 +286,11 @@ def score_fused_sequence(model,
         model: Object with ``fusion`` and ``temporal`` modules
         fused: (N, D) fused features for one video
         smoothing_window: Causal moving-average window (1 disables smoothing)
-        chunk_size: Temporal chunk size
+        chunk_size: Batch/chunk size for the temporal model
+        context_length: Frames of context per prediction; defaults to
+            ``model.context_length``.  ``0`` selects legacy stateful scoring.
+        smoothing_method: ``"moving_average"`` or ``"exponential"``
+        ema_alpha: EMA coefficient for ``"exponential"``
 
     Returns:
         (raw_scores, smoothed_scores), both float32 arrays of length N
@@ -187,31 +299,17 @@ def score_fused_sequence(model,
         raise ValueError(f"fused must be (N, D); got {tuple(fused.shape)}")
 
     total = fused.shape[0]
-    raw = np.zeros(total, dtype=np.float32)
     if total == 0:
-        return raw, raw
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty
 
-    state = None
-    previous_prediction = None
-    offset = 0
-    for start in range(0, total, chunk_size):
-        end = min(start + chunk_size, total)
-        chunk = fused[start:end].unsqueeze(0)  # (1, C, D)
-        predictions, state = model.temporal.forward_sequence(chunk, state)
-        predictions = predictions.squeeze(0)  # (C, D)
-        length = end - start
+    window = _context_length(model, context_length)
+    if window:
+        raw = _score_windowed(model, fused, window, chunk_size)
+    else:
+        raw = _score_stateful(model, fused, chunk_size)
 
-        if length > 1:
-            errors = F.mse_loss(predictions[:-1], fused[start + 1:end], reduction="none").mean(dim=1)
-            raw[start + 1:end] = errors.detach().cpu().numpy()
-        if previous_prediction is not None:
-            raw[start] = F.mse_loss(
-                previous_prediction, fused[start], reduction="none"
-            ).mean().item()
-        previous_prediction = predictions[-1].detach()
-        offset = end
-
-    smoothed = causal_moving_average(raw, smoothing_window)
+    smoothed = smooth_scores(raw, smoothing_method, smoothing_window, ema_alpha)
     return raw, smoothed
 
 
@@ -220,7 +318,9 @@ def score_cache_file(model,
                      cache_path: Union[str, Path],
                      smoothing_window: int = 1,
                      chunk_size: int = 256,
-                     device: Optional[Union[str, torch.device]] = None) -> Dict[str, Any]:
+                     device: Optional[Union[str, torch.device]] = None,
+                     smoothing_method: str = "moving_average",
+                     ema_alpha: float = 0.3) -> Dict[str, Any]:
     """
     Score every frame in a cached feature file.
 
@@ -260,7 +360,10 @@ def score_cache_file(model,
         )
     fused = torch.cat(fused_chunks, dim=0) if fused_chunks else rgb.new_zeros((0, 512))
 
-    raw, smoothed = score_fused_sequence(model, fused, smoothing_window, chunk_size)
+    raw, smoothed = score_fused_sequence(
+        model, fused, smoothing_window, chunk_size,
+        smoothing_method=smoothing_method, ema_alpha=ema_alpha,
+    )
 
     labels = data.get("labels")
     if labels is None:
@@ -282,6 +385,9 @@ def score_cache_file(model,
         "num_frames": int(raw.size),
         "has_ir": has_ir,
         "fps": data.get("fps", metadata.get("fps")),
+        "frame_indices": data.get("frame_indices", metadata.get("frame_indices")),
+        "frame_stride": int(data.get("frame_stride", metadata.get("frame_stride", 1)) or 1),
+        "start_frame": int(data.get("start_frame", metadata.get("start_frame", 0)) or 0),
         "cache_path": str(cache_path),
     }
 
@@ -296,20 +402,35 @@ def _model_device(model) -> torch.device:
         return torch.device("cpu")
 
 
+def raw_score_sequences(model,
+                        cache_paths,
+                        chunk_size: int = 256,
+                        device: Optional[Union[str, torch.device]] = None):
+    """Per-video raw score arrays (frame 0 included as the 0.0 placeholder)."""
+    sequences = []
+    for path in cache_paths:
+        result = score_cache_file(model, path, smoothing_window=1, chunk_size=chunk_size, device=device)
+        sequences.append(result["raw_scores"])
+    return sequences
+
+
 def prediction_errors(model,
                       cache_paths,
                       smoothing_window: int = 1,
                       chunk_size: int = 256,
-                      device: Optional[Union[str, torch.device]] = None) -> np.ndarray:
-    """Collect non-zero prediction errors from one or more cache files."""
+                      device: Optional[Union[str, torch.device]] = None,
+                      smoothing_method: str = "moving_average",
+                      ema_alpha: float = 0.3) -> np.ndarray:
+    """
+    Collect per-frame errors from cache files, smoothed like the app would.
+
+    Frame 0 of each video has no prediction; its placeholder zero is not a
+    real normal-data error and is excluded.
+    """
     errors = []
-    for path in cache_paths:
-        result = score_cache_file(
-            model, path, smoothing_window=1, chunk_size=chunk_size, device=device
-        )
-        # Frame 0 has no prediction and its placeholder zero is not a real
-        # normal-data error; exclude it from calibration statistics.
-        errors.append(result["raw_scores"][1:])
+    for raw in raw_score_sequences(model, cache_paths, chunk_size=chunk_size, device=device):
+        smoothed = smooth_scores(raw, smoothing_method, smoothing_window, ema_alpha)
+        errors.append(smoothed[1:])
     if not errors:
         return np.zeros((0,), dtype=np.float32)
     return np.concatenate(errors).astype(np.float32)

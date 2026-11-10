@@ -97,10 +97,28 @@ class ResNet50FeatureExtractor(nn.Module):
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
         self.backbone.eval()
         self.backbone.to(self.device)
+        # Frozen by default: the cached-feature pipeline and inference assume
+        # fixed ImageNet features.  Stage-2 tuning opts in to layer4 only.
+        self.set_trainable(False)
 
         self.feature_dim = 2048
 
         logger.info(f"ResNet50 feature extractor loaded on {self.device}")
+
+    def train(self, mode: bool = True):
+        """
+        Switch train/eval mode while keeping BatchNorm frozen.
+
+        BatchNorm running statistics are never updated: the encoder is tuned
+        with batches of one or two videos, which would corrupt the ImageNet
+        statistics, and encoder BN buffers would otherwise differ between
+        training and the cached features used everywhere else.
+        """
+        super().train(mode)
+        for module in self.backbone.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features from a normalized (B, 3, H, W) tensor."""

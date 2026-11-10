@@ -21,6 +21,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Bake the ImageNet ResNet50 and YOLO weights into the image instead of
+# downloading them on every container start.
+ENV TORCH_HOME=/opt/torch YOLO_CONFIG_DIR=/opt/ultralytics
+RUN python -c "from torchvision.models import resnet50, ResNet50_Weights; resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)" && \
+    python -c "from ultralytics import YOLO; YOLO('yolov8n-seg.pt')"
+
+# .dockerignore keeps Data/, cache/, .git and virtualenvs out of the image.
 COPY . .
 
 EXPOSE 8501

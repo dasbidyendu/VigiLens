@@ -12,6 +12,7 @@ Detects anomalies via prediction error.
 """
 
 import logging
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -61,7 +62,18 @@ class VigiLensModel(nn.Module):
                  lstm_hidden_size: int = 256,
                  lstm_layers: int = 2,
                  lstm_dropout: float = 0.2,
-                 load_extractors: bool = True):
+                 load_extractors: bool = True,
+                 context_length: Optional[int] = 15):
+        """
+        Args:
+            context_length: Number of past fused frames the LSTM sees when it
+                predicts the next frame at inference time.  Training uses
+                windows of ``sequence_length`` frames that each start from a
+                zero hidden state, so the matching value is
+                ``sequence_length - 1`` (15 by default).  ``None`` or ``0``
+                keeps the LSTM state across the whole stream instead (legacy
+                behaviour, not what the model was trained for).
+        """
         super().__init__()
 
         self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
@@ -95,9 +107,16 @@ class VigiLensModel(nn.Module):
             dropout=lstm_dropout
         )
 
+        self.context_length: Optional[int] = int(context_length) if context_length else None
+
         # Streaming state
         self.hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.previous_prediction: Optional[torch.Tensor] = None
+        self._context: deque = deque(maxlen=self.context_length or 1)
+
+        # Fusion/temporal weights live on the same device as the extracted
+        # features.  (The extractors manage their own device placement.)
+        super().to(self.device)
 
         logger.info("VigiLens model initialized")
 
@@ -165,6 +184,7 @@ class VigiLensModel(nn.Module):
         """Reset streaming state (hidden state and previous prediction)."""
         self.hidden_state = None
         self.previous_prediction = None
+        self._context.clear()
         logger.debug("Stream state reset")
 
     def init_hidden(self, batch_size: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -210,7 +230,15 @@ class VigiLensModel(nn.Module):
                 error = F.mse_loss(self.previous_prediction, fused, reduction="none")
                 anomaly_score = error.mean().item()
 
-            prediction, (h, c) = self.forward(fused, self.hidden_state)
+            if self.context_length:
+                # Same view of the past as in training: the last
+                # ``context_length`` frames, starting from a zero state.
+                self._context.append(fused.detach())
+                window = torch.cat(list(self._context), dim=0).unsqueeze(0)
+                predictions, (h, c) = self.temporal.forward_sequence(window)
+                prediction = predictions[:, -1]
+            else:
+                prediction, (h, c) = self.forward(fused, self.hidden_state)
 
             # Detach state to prevent graph growth across frames.
             self.hidden_state = (h.detach(), c.detach())
@@ -290,28 +318,46 @@ class VigiLensModel(nn.Module):
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, path: str, strict: bool = True) -> Dict:
-        """Load a checkpoint. Falls back to weights_only=False for old files."""
+    def load_checkpoint(self, path: str, strict: bool = True,
+                        allow_unsafe_pickle: bool = False) -> Dict:
+        """
+        Load a checkpoint.
+
+        Checkpoints are loaded with ``weights_only=True``, which cannot run
+        code embedded in the file.  ``allow_unsafe_pickle=True`` permits the
+        full pickle loader for old checkpoints from a *trusted* source only.
+
+        With ``strict=True`` (the default) a checkpoint whose keys or shapes do
+        not match this model raises instead of silently leaving layers at
+        their random initialisation.
+        """
         try:
-            checkpoint = torch.load(
-                path, map_location=self.device, weights_only=True
-            )
-        except Exception:
-            # Older checkpoints may contain dataclass config objects.
-            checkpoint = torch.load(
-                path, map_location=self.device, weights_only=False
-            )
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        except Exception as exc:
+            if not allow_unsafe_pickle:
+                raise RuntimeError(
+                    f"Could not load {path} with weights_only=True ({exc}). "
+                    "If this is an old checkpoint from a trusted source, call "
+                    "load_checkpoint(..., allow_unsafe_pickle=True) once and "
+                    "re-save it."
+                ) from exc
+            logger.warning("Loading %s with the unsafe pickle loader", path)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         state = checkpoint.get("model_state_dict", checkpoint)
-        try:
-            self.load_state_dict(state, strict=strict)
-        except RuntimeError as exc:
-            if not strict:
-                raise
+        result = self.load_state_dict(state, strict=strict)
+        if not strict and (result.missing_keys or result.unexpected_keys):
             logger.warning(
-                "Strict checkpoint load failed (%s); retrying with strict=False", exc
+                "Non-strict checkpoint load: missing=%s unexpected=%s",
+                result.missing_keys, result.unexpected_keys,
             )
-            self.load_state_dict(state, strict=False)
+
+        # Match the inference context to the training window length.
+        config = checkpoint.get("config") or {}
+        training_cfg = config.get("training") if isinstance(config, dict) else None
+        if self.context_length and isinstance(training_cfg, dict) and training_cfg.get("sequence_length"):
+            self.context_length = max(1, int(training_cfg["sequence_length"]) - 1)
+            self._context = deque(maxlen=self.context_length)
 
         encoders = checkpoint.get("encoder_state_dict")
         if encoders:

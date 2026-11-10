@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Tuple, Optional, Union
 import logging
 
-logging.basicConfig(level=logging.INFO)
+# No logging.basicConfig() here: configuring the root logger at import time
+# overrides the caller's logging setup.
 logger = logging.getLogger(__name__)
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}

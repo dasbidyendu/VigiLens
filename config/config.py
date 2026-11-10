@@ -101,11 +101,17 @@ class InferenceConfig:
     yolo_model_path: str = "yolov8n-seg.pt"
     yolo_conf: float = 0.25
     yolo_retina_masks: bool = True
+    # Re-use the previous person mask for up to N frames when YOLO misses a
+    # detection (avoids full-frame/masked feature jumps).  Precompute uses the
+    # same value so training features follow the same rule.
+    mask_hold_frames: int = 5
 
     # Checkpoint
     checkpoint_path: str = "checkpoints/best_model.pth"
 
-    # Default threshold used when calibration is unavailable
+    # Threshold used only when no calibration file is available.  It is a
+    # placeholder: prediction-error scales depend on the trained model, so
+    # the app flags the stream as uncalibrated when this value is used.
     default_threshold: float = 0.5
 
 
@@ -178,6 +184,7 @@ class SystemConfig:
                 "yolo_model_path": self.inference.yolo_model_path,
                 "yolo_conf": self.inference.yolo_conf,
                 "yolo_retina_masks": self.inference.yolo_retina_masks,
+                "mask_hold_frames": self.inference.mask_hold_frames,
                 "checkpoint_path": self.inference.checkpoint_path,
                 "default_threshold": self.inference.default_threshold,
             },

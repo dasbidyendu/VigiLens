@@ -105,7 +105,14 @@ def main() -> None:
             if sequence_id in segments:
                 entry["segments"] = segments[sequence_id]
             elif args.anomaly_all:
-                entry["segments"] = []
+                # Whole video anomalous: the entry's "label": "anomaly" already
+                # says so.  (An empty "segments" list would mean "no anomalous
+                # frames" and label the whole video normal.)
+                pass
+            elif "frame_labels" not in entry:
+                print(f"WARNING: anomaly video {sequence_id} has no segments or frame labels; "
+                      "treating every frame as anomalous (pass --anomaly-all to silence)",
+                      file=sys.stderr)
 
     output = Path(args.output) if args.output else root / "manifest.json"
     manifest = {

@@ -32,15 +32,15 @@ def _draw_frame(width: int,
                 frames: int,
                 phase: float,
                 anomalous: bool,
-                rng: np.random.Generator):
+                rng: np.random.Generator,
+                background: list):
     rgb = np.full((height, width, 3), 22, dtype=np.uint8)
     ir = np.full((height, width), 12, dtype=np.uint8)
 
-    # Background texture.
-    for _ in range(8):
-        x = int(rng.integers(0, width))
-        y = int(rng.integers(0, height))
-        cv2.circle(rgb, (x, y), int(rng.integers(4, 18)), (40, 40, 40), -1)
+    # Static background texture (fixed per video, so it does not flicker:
+    # a static scene is "normal" and must not look like constant change).
+    for x, y, radius in background:
+        cv2.circle(rgb, (x, y), radius, (40, 40, 40), -1)
 
     margin = max(12, width // 8)
     speed = 1.0
@@ -61,6 +61,12 @@ def _draw_frame(width: int,
     return rgb, ir
 
 
+def _background(width: int, height: int, seed: int) -> list:
+    rng = np.random.default_rng(seed)
+    return [(int(rng.integers(0, width)), int(rng.integers(0, height)), int(rng.integers(4, 18)))
+            for _ in range(8)]
+
+
 def _write_video(path: Path,
                  frames: int,
                  width: int,
@@ -76,9 +82,10 @@ def _write_video(path: Path,
     if not writer.isOpened():
         raise RuntimeError(f"Could not open VideoWriter for {path}")
     rng = np.random.default_rng(seed)
+    background = _background(width, height, seed)
     try:
         for t in range(frames):
-            rgb, _ = _draw_frame(width, height, t, frames, phase, anomalous, rng)
+            rgb, _ = _draw_frame(width, height, t, frames, phase, anomalous, rng, background)
             writer.write(rgb)
     finally:
         writer.release()
@@ -98,10 +105,13 @@ def _write_ir_video(path: Path,
     )
     if not writer.isOpened():
         raise RuntimeError(f"Could not open VideoWriter for {path}")
+    # Separate noise stream for IR; the scene geometry (background, target
+    # path) is shared with the RGB video so the pair stays consistent.
     rng = np.random.default_rng(seed + 1)
+    background = _background(width, height, seed)
     try:
         for t in range(frames):
-            _, ir = _draw_frame(width, height, t, frames, phase, anomalous, rng)
+            _, ir = _draw_frame(width, height, t, frames, phase, anomalous, rng, background)
             writer.write(ir)
     finally:
         writer.release()

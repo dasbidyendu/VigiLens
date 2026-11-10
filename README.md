@@ -33,7 +33,7 @@ It supports paired **visible (RGB) + infrared/thermal (IR)** video, and also RGB
 - **Normal-only training.** No anomaly labels are needed for training or calibration.
 - **Pedestrian-focused features.** YOLOv8n-seg masks restrict ResNet50 features to people when a person is detected; otherwise the full frame is used.
 - **Modality-aware fusion.** RGB+IR, RGB-only, and IR-only inputs all produce a fixed 512-D embedding. Availability is tracked per sample, so mixed batches are handled correctly.
-- **Causal streaming inference.** A unidirectional LSTM keeps hidden state across frames and never looks at future frames.
+- **Causal streaming inference.** A unidirectional LSTM predicts each frame from the previous `sequence_length - 1` frames (the same window it was trained on) and never looks at future frames. Offline scoring and the app produce identical scores.
 - **One-frame prediction latency.** The score for frame `t+1` is the error between the feature predicted from frame `t` and the actual feature at `t+1`. Frame 0 has no score.
 - **Calibrated thresholds.** The threshold is computed from prediction errors on held-out normal videos.
 - **Frame-level evaluation.** AUC, average precision, precision/recall/F1, FPR, FPR@95%TPR, per-video summaries, and CSV/JSON exports.
@@ -115,7 +115,7 @@ VigiLens/
 Python 3.10+ is recommended. A CUDA GPU is optional but strongly recommended for precomputation and online training; cached fusion/LSTM training runs comfortably on CPU for small datasets.
 
 ```bash
-git clone https://github.com/soumyaranjan4446/VigiLens.git
+git clone https://github.com/Gauranga025/VigiLens.git
 cd VigiLens
 
 python -m venv .venv
@@ -308,13 +308,15 @@ threshold_percentile = percentile(errors, p)
 
 The default saved threshold is `mean + 3*std`; the percentile alternative is stored alongside it. Frame 0 is excluded because it has no previous prediction.
 
+Smoothing shrinks the spread of normal scores, so one threshold cannot serve every smoothing setting. `calibration.json` therefore also stores `thresholds.moving_average["1".."30"]` and `thresholds.exponential["<alpha>"]`, each computed on the smoothed scores the app would produce, plus the SHA-256 of the checkpoint it belongs to.
+
 ```bash
 python -m training.calibration --cache-dir cache/val \
     --checkpoint checkpoints/best_model.pth \
     --output checkpoints/calibration.json --device cuda --k-std 3.0 --percentile 95
 ```
 
-Training can do this automatically with `--calibrate`. The Streamlit app and evaluation loader read `threshold` (falling back to `threshold_std`).
+Training can do this automatically with `--calibrate` (it calibrates `best_model.pth`, not the last epoch). The app and `training.evaluate` pick the threshold that matches their smoothing setting (`training.calibration.threshold_for`); the app ignores a calibration file that was computed for a different checkpoint.
 
 ---
 
@@ -345,9 +347,11 @@ Evaluation is manifest-based so it can describe any dataset. Example:
 Labels are resolved in this priority order:
 
 1. `frame_labels`: a `.txt` file (one 0/1 or `normal`/`anomaly` per line) or a `.npy` array.
-2. `segments`: anomalous `[start, end)` frame intervals.
+2. `segments`: anomalous `[start, end)` frame intervals (a missing or empty list means "use `label`").
 3. `label`: `"normal"` or `"anomaly"` for the whole video.
 4. Labels stored in the precomputed cache.
+
+Frame numbers refer to the original video and are mapped through the cache's `frame_indices`, so they stay aligned with `--frame-stride`.
 
 Build a manifest from `Evaluation/normal/` and `Evaluation/anomaly/` folders:
 
@@ -369,29 +373,18 @@ python -m training.evaluate --manifest Evaluation/manifest.json \
 
 Outputs:
 
-- `scores.csv`: `sequence_id, frame_index, raw_score, smoothed_score, label`
+- `scores.csv`: `sequence_id, frame_index, video_frame, scored, raw_score, smoothed_score, label` (`scored=0` marks the unscored first frame)
 - `results.json`: threshold, metrics, per-video summaries, calibration metadata
 
 Reported metrics are frame-level: ROC-AUC, average precision, precision/recall/F1 at the calibrated (or requested) threshold, accuracy, TPR/FNR, FPR, FPR@95%TPR, confusion counts, and the best-F1 threshold. `metrics_raw` and `metrics_smoothed` are both included. A normal-only evaluation set is valid: AUC/AP are `NaN`, while FPR remains meaningful.
 
-**Important:** the anomaly score for frame `t+1` uses the feature prediction from frame `t`. Frame 0 is assigned score `0.0` and should not be interpreted as a real measurement. When labels mark the first frame as anomalous, either exclude it or account for the one-frame latency.
+**Important:** the anomaly score for frame `t+1` uses the feature prediction from frame `t`. Frame 0 of each video has no score and is excluded from all metrics. `metrics_at_best_f1_threshold` tunes the threshold on the evaluation set itself, so treat it as an optimistic upper bound, not a result.
 
 ---
 
 ## Google Colab (T4)
 
-Open `notebooks/VigiLens_Colab.ipynb` in Colab and select a GPU runtime. The notebook:
-
-1. Checks the GPU and enables FP16 AMP.
-2. Clones the repository and installs requirements.
-3. Optionally mounts Google Drive for dataset/results persistence.
-4. Creates the synthetic smoke dataset or prepares OTCBVS/KAIST.
-5. Precomputes features.
-6. Trains fusion + LSTM on cached features.
-7. Calibrates and evaluates with real metrics.
-8. Exports checkpoints, calibration, `results.json`, and `scores.csv` to Drive.
-
-For a first real-data run, OTCBVS with `--max-frames 300` is a good preview. KAIST with `--sets 00 --max-frames 300` gives a larger normal corpus. Full KAIST training benefits from a longer precompute and more epochs.
+Open `notebooks/VigiLens_Colab.ipynb` in Colab and select a GPU runtime. Set `DATASET` to `vidllvip`, `kaist` (paired RGB+IR, normal-only, no anomaly labels) or `ped2` (UCSD Ped2: visible-only, frame-level anomaly labels, gives AUC/AP). The notebook copies the dataset archive from Google Drive, prepares it, runs an optional smoke test, precomputes features, trains, calibrates the best checkpoint, evaluates, and saves the checkpoint and calibration back to Drive. A section at the end evaluates your own labeled RGB+IR clips.
 
 ---
 
@@ -401,9 +394,9 @@ For a first real-data run, OTCBVS with `--max-frames 300` is a good preview. KAI
 streamlit run app.py
 ```
 
-Open `http://localhost:8501`. Upload a visible video and, optionally, an aligned IR video. The sidebar selects the checkpoint, calibration file, YOLO model, device, and smoothing method/window.
+Open `http://localhost:8501`. Upload a visible video and, optionally, an aligned IR video. The sidebar selects the checkpoint, calibration file, and smoothing method/window.
 
-The app loads the checkpoint and calibration once per process, runs YOLO once per frame (the mask is reused for IR), maintains LSTM state across frames, and displays the raw/smoothed score, status, FPS, and optional masks. If no checkpoint or calibration is found, it warns and uses an untrained model with threshold `0.5`.
+The app loads the checkpoint and calibration once per process, runs YOLO once per frame (the mask is reused for IR and held for up to 5 frames when a detection is missed), and displays the smoothed score, status, FPS, and optional masks. Only files in `checkpoints/` can be selected. Uploaded videos are written to `.tmp/uploads/` in the repository (override with `VIGILENS_UPLOAD_DIR`). One video is analysed at a time. If no checkpoint or matching calibration is found, it warns that the model is untrained or the threshold is uncalibrated.
 
 ---
 

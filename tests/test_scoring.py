@@ -10,6 +10,7 @@ from training.scoring import (
     prediction_errors,
     score_cache_file,
     score_fused_sequence,
+    smooth_scores,
 )
 
 
@@ -41,7 +42,11 @@ def test_score_cache_file_starts_at_zero_and_smooths_causally(tiny_model, make_c
     assert raw.shape == (8,)
     assert raw[0] == 0.0
     assert np.isfinite(raw).all()
-    np.testing.assert_allclose(smoothed, causal_moving_average(raw, 3), rtol=1e-6)
+    # Frame 0 is an unscored placeholder; smoothing starts at frame 1, like
+    # the streaming pipeline.
+    assert smoothed[0] == 0.0
+    np.testing.assert_allclose(smoothed[1:], causal_moving_average(raw[1:], 3), rtol=1e-6)
+    np.testing.assert_allclose(smoothed, smooth_scores(raw, "moving_average", 3), rtol=1e-6)
     assert result["labels"].tolist() == [0] * 8
     assert result["num_frames"] == 8
     assert result["has_ir"] is True

@@ -1,0 +1,25 @@
+# Keep the image small and free of local data / secrets.
+.git
+.gitignore
+.venv
+venv
+.tmp
+.cache
+__pycache__
+*.py[cod]
+.pytest_cache
+Data
+Data_smoke
+data
+cache
+cache_smoke
+Evaluation
+checkpoints_smoke
+notebooks
+tests
+*.mp4
+*.avi
+*.mov
+*.mkv
+.env
+.env.*

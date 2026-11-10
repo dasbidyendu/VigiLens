@@ -1,8 +1,9 @@
 """
 Frame preprocessing for visible and IR/thermal inputs.
 
-This module mirrors the preprocessing used by ``models.feature_extractor`` so
-that ad-hoc preprocessing and model preprocessing cannot drift apart:
+This module re-uses the helpers from ``models.feature_extractor`` (rather than
+copying them) so ad-hoc preprocessing and model preprocessing cannot drift
+apart:
 
 * visible frames are OpenCV BGR -> RGB, resized, scaled to [0, 1], then
   ImageNet-normalized;
@@ -21,54 +22,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-
-def _as_uint8(frame: np.ndarray) -> np.ndarray:
-    if frame.dtype == np.uint8:
-        return frame
-    frame = frame.astype(np.float32)
-    if frame.max() <= 1.0:
-        frame = frame * 255.0
-    return np.clip(frame, 0, 255).astype(np.uint8)
-
-
-def _ensure_rgb(frame: np.ndarray) -> np.ndarray:
-    frame = _as_uint8(frame)
-    if frame.ndim == 2:
-        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    elif frame.ndim == 3 and frame.shape[2] == 1:
-        frame = cv2.cvtColor(frame[:, :, 0], cv2.COLOR_GRAY2BGR)
-    elif frame.ndim == 3 and frame.shape[2] == 4:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-    elif frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError(f"Unsupported visible frame shape: {frame.shape}")
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-
-def _ensure_gray(frame: np.ndarray) -> np.ndarray:
-    frame = _as_uint8(frame)
-    if frame.ndim == 2:
-        return frame
-    if frame.ndim == 3 and frame.shape[2] == 1:
-        return frame[:, :, 0]
-    if frame.ndim == 3 and frame.shape[2] == 3:
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    if frame.ndim == 3 and frame.shape[2] == 4:
-        return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported IR frame shape: {frame.shape}")
-
-
-def _resize_mask(mask: Optional[np.ndarray], size: Tuple[int, int]) -> Optional[np.ndarray]:
-    if mask is None:
-        return None
-    mask = np.asarray(mask)
-    if mask.ndim == 3:
-        mask = mask[:, :, 0]
-    if mask.shape[:2] != size:
-        mask = cv2.resize(mask, (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
-    return (mask > 0).astype(np.float32)
+from models.feature_extractor import (  # noqa: E402  (single source of truth)
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    _as_uint8,
+    _ensure_gray,
+    _ensure_rgb,
+    _resize_mask,
+)
 
 
 class FramePreprocessor:

@@ -30,8 +30,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from training.utils import ensure_dir, safe_stem
-from prepare_otcbvs import _write_pair_from_images, split_pairs
+from training.utils import ensure_dir, prepare_split_dirs, safe_stem
+# Package import so this works both as a script and as ``scripts.prepare_kaist``.
+from scripts.prepare_otcbvs import _write_pair_from_images, split_pairs
 
 
 def discover_sequences(root: Path) -> List[Tuple[Path, Path, str]]:
@@ -75,6 +76,8 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--manifest", default=None)
+    parser.add_argument("--clean", action="store_true",
+                        help="Delete existing <output>/train and <output>/val folders first")
     args = parser.parse_args()
 
     root = Path(args.input)
@@ -101,15 +104,30 @@ def main() -> None:
         train_sequences = [item for item in sequences if _set_number(item[2]) not in val_sets]
         val_sequences = [item for item in sequences if _set_number(item[2]) in val_sets]
     else:
-        # split_pairs expects (rgb, ir) tuples; keep sequence ids separately.
-        train_pairs, val_pairs = split_pairs(
-            [(item[0], item[1]) for item in sequences], args.val_ratio, args.seed
-        )
-        pair_to_id = {(item[0], item[1]): item[2] for item in sequences}
-        train_sequences = [(rgb, ir, pair_to_id[(rgb, ir)]) for rgb, ir in train_pairs]
-        val_sequences = [(rgb, ir, pair_to_id[(rgb, ir)]) for rgb, ir in val_pairs]
+        # Consecutive KAIST sequences (V000, V001, ...) of one set come from
+        # the same drive, so a random *sequence* split leaks near-identical
+        # scenes into validation.  Hold out whole sets instead.
+        set_numbers = {_set_number(item[2]) for item in sequences}
+        sets = sorted(number for number in set_numbers if number is not None)
+        if len(sets) >= 2 and None not in set_numbers:
+            set_pairs = [(Path(str(number)), Path(str(number))) for number in sets]
+            _train_sets, held_out = split_pairs(set_pairs, args.val_ratio, args.seed)
+            val_sets = {int(str(pair[0])) for pair in held_out}
+            print(f"Set-level split: validation sets {sorted(val_sets)}")
+            train_sequences = [item for item in sequences if _set_number(item[2]) not in val_sets]
+            val_sequences = [item for item in sequences if _set_number(item[2]) in val_sets]
+        else:
+            print("WARNING: only one KAIST set selected; falling back to a sequence-level "
+                  "split, which can leak near-identical scenes. Prefer --val-sets.")
+            train_pairs, val_pairs = split_pairs(
+                [(item[0], item[1]) for item in sequences], args.val_ratio, args.seed
+            )
+            pair_to_id = {(item[0], item[1]): item[2] for item in sequences}
+            train_sequences = [(rgb, ir, pair_to_id[(rgb, ir)]) for rgb, ir in train_pairs]
+            val_sequences = [(rgb, ir, pair_to_id[(rgb, ir)]) for rgb, ir in val_pairs]
 
     output = Path(args.output)
+    prepare_split_dirs(output, ("train", "val"), args.clean)
     records = []
     for split, split_sequences in (("train", train_sequences), ("val", val_sequences)):
         for visible_dir, ir_dir, sequence_id in split_sequences:
