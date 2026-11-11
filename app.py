@@ -118,7 +118,11 @@ def load_runtime(device: str,
 
 
 def _choices(directory: Path, pattern: str, default: str) -> list:
-    found = sorted(str(path.relative_to(REPO_ROOT)) for path in directory.glob(pattern)) if directory.exists() else []
+    # Recursive, because the notebook saves runs to checkpoints/<dataset>/;
+    # POSIX paths so the default ("checkpoints/best_model.pth") is not listed
+    # twice on Windows.
+    found = sorted(path.relative_to(REPO_ROOT).as_posix()
+                   for path in directory.rglob(pattern)) if directory.exists() else []
     if default not in found:
         found.insert(0, default)
     return found
