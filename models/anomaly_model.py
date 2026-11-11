@@ -108,6 +108,9 @@ class VigiLensModel(nn.Module):
         )
 
         self.context_length: Optional[int] = int(context_length) if context_length else None
+        # Person-masked (True) or full-frame (False) features; set from the
+        # checkpoint by load_checkpoint so inference matches training.
+        self.use_segmentation: bool = True
 
         # Streaming state
         self.hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -358,6 +361,10 @@ class VigiLensModel(nn.Module):
         if self.context_length and isinstance(training_cfg, dict) and training_cfg.get("sequence_length"):
             self.context_length = max(1, int(training_cfg["sequence_length"]) - 1)
             self._context = deque(maxlen=self.context_length)
+
+        inference_cfg = config.get("inference") if isinstance(config, dict) else None
+        if isinstance(inference_cfg, dict) and "use_segmentation" in inference_cfg:
+            self.use_segmentation = bool(inference_cfg["use_segmentation"])
 
         encoders = checkpoint.get("encoder_state_dict")
         if encoders:

@@ -62,6 +62,13 @@ class TrainingConfig:
     seed: int = 42
     num_workers: int = 0
     train_encoders: bool = False
+    # Keep the fusion layer at its (seeded) random initialisation.  The
+    # temporal model predicts the fused feature of the next frame, so a
+    # trainable fusion can shrink its own output spread to make prediction
+    # easy (representation collapse), which flattens the anomaly score.  A
+    # frozen fusion is a fixed target: on UCSD Ped2 it raised frame AUC from
+    # 0.770 to 0.804 (full-frame features, smoothing window 10).
+    freeze_fusion: bool = True
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -105,6 +112,11 @@ class InferenceConfig:
     # detection (avoids full-frame/masked feature jumps).  Precompute uses the
     # same value so training features follow the same rule.
     mask_hold_frames: int = 5
+    # Whether features are computed on the YOLO person mask (True) or on the
+    # full frame (False).  Training records the setting of its feature cache
+    # in the checkpoint, and the app follows the checkpoint, so features at
+    # inference match the ones the model was trained on.
+    use_segmentation: bool = True
 
     # Checkpoint
     checkpoint_path: str = "checkpoints/best_model.pth"
@@ -169,6 +181,7 @@ class SystemConfig:
                 "seed": self.training.seed,
                 "num_workers": self.training.num_workers,
                 "train_encoders": self.training.train_encoders,
+                "freeze_fusion": self.training.freeze_fusion,
                 "checkpoint_dir": self.training.checkpoint_dir,
                 "cache_dir": self.training.cache_dir,
             },
@@ -185,6 +198,7 @@ class SystemConfig:
                 "yolo_conf": self.inference.yolo_conf,
                 "yolo_retina_masks": self.inference.yolo_retina_masks,
                 "mask_hold_frames": self.inference.mask_hold_frames,
+                "use_segmentation": self.inference.use_segmentation,
                 "checkpoint_path": self.inference.checkpoint_path,
                 "default_threshold": self.inference.default_threshold,
             },

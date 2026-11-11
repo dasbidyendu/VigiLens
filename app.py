@@ -104,7 +104,14 @@ def load_runtime(device: str,
     else:
         messages.append(("warning", f"Calibration not found: {calibration_path}. Using default threshold."))
 
-    segmentation = YOLOSegmentation(model_path=yolo_model_path, device=device)
+    # Compute features the way the checkpoint was trained: on YOLO person
+    # masks, or on the full frame.
+    if model.use_segmentation:
+        segmentation = YOLOSegmentation(model_path=yolo_model_path, device=device)
+    else:
+        segmentation = None
+        messages.append(("info", "This checkpoint was trained on full-frame features; "
+                                 "person segmentation is off."))
     # One shared model instance holds per-stream state, so only one video can
     # be analysed at a time across all browser sessions.
     return model, segmentation, calibration_info, messages, threading.Lock()

@@ -114,3 +114,55 @@ def test_checkpoint_round_trip_without_extractors(tmp_path):
         assert "load_extractors=True" in str(exc)
     else:
         raise AssertionError("include_encoders should require extractors")
+
+
+def test_frozen_fusion_is_not_updated_by_training(tiny_model, make_cache, tmp_path):
+    train_cache = make_cache(tmp_path / "cache" / "train" / "a.pt", num_frames=12, has_ir=True)
+    val_cache = make_cache(tmp_path / "cache" / "val" / "b.pt", num_frames=10, has_ir=True, seed=1)
+    for parameter in tiny_model.fusion.parameters():
+        parameter.requires_grad_(False)
+    fusion_before = {k: v.clone() for k, v in tiny_model.fusion.state_dict().items()}
+    temporal_before = {k: v.clone() for k, v in tiny_model.temporal.state_dict().items()}
+
+    train_cached(
+        tiny_model, _dataset([train_cache]), _dataset([val_cache]), device="cpu",
+        epochs=1, batch_size=2, learning_rate=1e-2, amp=False,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+
+    for key, value in tiny_model.fusion.state_dict().items():
+        assert torch.equal(value, fusion_before[key]), key
+    assert any(not torch.equal(value, temporal_before[key])
+               for key, value in tiny_model.temporal.state_dict().items())
+
+
+def test_cache_segmentation_setting(tmp_path):
+    from training.train import cache_segmentation_setting
+
+    def sidecar(name, settings):
+        path = tmp_path / f"{name}.pt"
+        payload = {"sequence_id": name}
+        if settings is not None:
+            payload["settings"] = settings
+        path.with_suffix(".json").write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    full = [sidecar("a", {"segmentation": False}), sidecar("b", {"segmentation": False})]
+    masked = sidecar("c", {"segmentation": True})
+    unknown = sidecar("d", None)
+
+    assert cache_segmentation_setting(full) is False
+    assert cache_segmentation_setting([masked]) is True
+    assert cache_segmentation_setting([unknown]) is True
+    assert cache_segmentation_setting(full + [masked]) is True  # mixed: fall back to masks
+
+
+def test_checkpoint_carries_segmentation_setting(tmp_path):
+    model = VigiLensModel(device="cpu", load_extractors=False)
+    path = tmp_path / "checkpoint.pth"
+    model.save_checkpoint(str(path), epoch=1, loss=0.1,
+                          config={"inference": {"use_segmentation": False}})
+    loaded = VigiLensModel(device="cpu", load_extractors=False)
+    assert loaded.use_segmentation is True
+    loaded.load_checkpoint(str(path))
+    assert loaded.use_segmentation is False

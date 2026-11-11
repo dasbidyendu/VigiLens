@@ -35,7 +35,7 @@ from tqdm import tqdm
 from config.config import get_config
 from models.anomaly_model import VigiLensModel
 from training.dataset import CachedFeatureDataset, NormalVideoDataset, VideoBlockSampler
-from training.scoring import fuse_sequence
+from training.scoring import fuse_sequence, read_cache_metadata
 from training.utils import (
     DEFAULT_VIDEO_EXTENSIONS,
     discover_videos,
@@ -686,6 +686,24 @@ def validate_dataset(train_rgb: List[Path],
                 logger.warning("%s: frame count mismatch %s vs %s", split_name, rgb_path.name, ir_path.name)
 
 
+def cache_segmentation_setting(cache_paths: List[Path]) -> bool:
+    """Whether the feature caches were computed on YOLO person masks.
+
+    The setting is stored in the checkpoint so inference computes features
+    the same way.  Caches without the information count as segmented (the
+    precompute default).
+    """
+    values = set()
+    for path in cache_paths:
+        settings = read_cache_metadata(path).get("settings") or {}
+        values.add(bool(settings.get("segmentation", True)))
+    if len(values) > 1:
+        logger.warning("Training caches mix person-masked and full-frame features; "
+                       "inference will use person masks. Recompute the caches with one setting.")
+        return True
+    return values.pop() if values else True
+
+
 def get_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -755,6 +773,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit-batches", type=int, default=None)
     parser.add_argument("--unfreeze-layer4", action="store_true")
+    parser.add_argument("--freeze-fusion", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep the fusion layer fixed at its seeded initialisation so the "
+                             "next-feature target cannot collapse (default: on)")
     parser.add_argument("--calibrate", action="store_true", help="Calibrate after training")
     args = parser.parse_args()
 
@@ -768,11 +789,17 @@ def main() -> None:
     config.training.sequence_stride = args.seq_stride
     config.training.amp = args.amp
     config.training.num_workers = args.workers
+    config.training.freeze_fusion = args.freeze_fusion
 
     # Cached-feature training only needs fusion + temporal weights; avoid
     # downloading/instantiating two ResNet50 encoders in that path.
+    seed_everything(args.seed)  # the frozen fusion keeps this seeded initialisation
     model = VigiLensModel(device=args.device, load_extractors=args.online)
     model.to(args.device)
+    if args.freeze_fusion:
+        for parameter in model.fusion.parameters():
+            parameter.requires_grad_(False)
+        logger.info("Fusion layer frozen (use --no-freeze-fusion to train it)")
 
     if args.online:
         data_dir = Path(args.data_dir)
@@ -830,6 +857,9 @@ def main() -> None:
             rgb_dropout_prob=config.training.rgb_dropout_prob,
             ir_dropout_prob=config.training.ir_dropout_prob,
             seed=args.seed,
+        )
+        config.inference.use_segmentation = cache_segmentation_setting(
+            [Path(p) for p in train_dataset.cache_paths]
         )
         result = train_cached(
             model, train_dataset, val_dataset, args.device,
