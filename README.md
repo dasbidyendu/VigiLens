@@ -396,6 +396,8 @@ streamlit run app.py
 
 Open `http://localhost:8501`. Upload a visible video and, optionally, an aligned IR video. The sidebar selects the checkpoint, calibration file, and smoothing method/window.
 
+**Webcam mode:** switch *Source* to **Webcam**, pick the camera index and a time limit, and press **Start webcam** (any other click, e.g. **Stop**, ends the run). The camera is opened on the machine running Streamlit, frames are visible-only, and a score chart against the calibrated threshold updates live. The score measures how unusual the motion is compared with the training footage, so a model trained on one scene (e.g. UCSD Ped2) flags almost everything in a different scene: train on normal footage from the same camera for meaningful results.
+
 The app loads the checkpoint and calibration once per process, runs YOLO once per frame (the mask is reused for IR and held for up to 5 frames when a detection is missed), and displays the smoothed score, status, FPS, and optional masks. Only files in `checkpoints/` can be selected. Uploaded videos are written to `.tmp/uploads/` in the repository (override with `VIGILENS_UPLOAD_DIR`). One video is analysed at a time. If no checkpoint or matching calibration is found, it warns that the model is untrained or the threshold is uncalibrated.
 
 ---

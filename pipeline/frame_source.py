@@ -5,7 +5,7 @@ This module provides abstractions for reading synchronized visible and IR frames
 from various sources including:
 - Separate video files (visible.mp4, thermal.mp4)
 - Paired frame directories
-- Live camera inputs
+- Live camera inputs (CameraFrameSource, visible only)
 
 Convention: every frame returned by these sources is an OpenCV **BGR** array
 (or a single-channel IR array).  The model's feature extractors convert BGR to
@@ -13,6 +13,7 @@ RGB internally, so callers must not swap channels twice.
 """
 
 import re
+import sys
 import cv2
 import numpy as np
 from pathlib import Path
@@ -335,6 +336,75 @@ class SingleVideoSource(MultimodalFrameSource):
         """Release video capture resources."""
         if self.cap is not None:
             self.cap.release()
+
+
+class CameraFrameSource(MultimodalFrameSource):
+    """
+    Live camera (webcam) source, visible only.
+
+    The camera is opened on the machine running this code, i.e. the
+    Streamlit server, not the browser.  ``read()`` returns ``(None, None)``
+    once ``max_frames`` frames were read or the camera stops delivering.
+    """
+
+    def __init__(self, index: int = 0, max_frames: Optional[int] = None,
+                 width: Optional[int] = None, height: Optional[int] = None):
+        # No file paths here, so the base-class path checks are skipped.
+        self.visible_source = f"camera:{index}"
+        self.ir_source = None
+        self.ir_available = False
+        self.index = int(index)
+        self.max_frames = max_frames
+
+        self.cap = None
+        # DirectShow opens much faster than the default MSMF backend on Windows.
+        backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if sys.platform == "win32" else [cv2.CAP_ANY]
+        for backend in backends:
+            cap = cv2.VideoCapture(self.index, backend)
+            if cap.isOpened():
+                self.cap = cap
+                break
+            cap.release()
+        if self.cap is None:
+            raise RuntimeError(f"Could not open camera {index}")
+
+        if width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        if height:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        # Keep latency low: always read the newest frame, not a stale buffer.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Many webcam drivers report 0 or -1 when the rate is unknown.
+        reported_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        self.fps = reported_fps if reported_fps > 0 else 30.0
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_count = max_frames or 0
+        self.visible_fps = self.fps
+        self.ir_fps = None
+        self.visible_index = 0
+        logger.info(f"Camera {index}: {self.width}x{self.height} @ {self.fps:.2f} FPS (visible only)")
+
+    def read(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.cap is None:
+            return None, None
+        if self.max_frames is not None and self.visible_index >= self.max_frames:
+            return None, None
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            return None, None
+        self.visible_index += 1
+        return frame, None
+
+    def reset(self):
+        """A live camera cannot rewind; only the frame budget restarts."""
+        self.visible_index = 0
+
+    def release(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
 
 def create_frame_source(visible_source: Union[str, Path], 
