@@ -277,7 +277,12 @@ def run_analysis(open_source, show_ir_frames: bool, max_seconds: float | None = 
             m_ir.metric("IR Available", "Yes" if result["ir_available"] else "No")
             m_threshold.metric("Threshold", f"{pipeline.threshold:.4f}")
 
-            status_box.error("ANOMALY DETECTED") if result["is_anomalous"] else status_box.success("NORMAL")
+            # A plain if/else: a bare conditional expression would be echoed
+            # onto the page by Streamlit's "magic" display.
+            if result["is_anomalous"]:
+                status_box.error("ANOMALY DETECTED")
+            else:
+                status_box.success("NORMAL")
 
             if visible_frame is not None:
                 display = cv2.resize(visible_frame, (720, 480))
